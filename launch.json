@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Ejecutar chatbot",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/chatbot.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}
