@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
@@ -6,6 +6,7 @@ import random
 from pymongo import MongoClient
 import ollama
 import uvicorn
+from uuid import uuid4
 
 # --- Configuración MongoDB ---
 client = MongoClient("mongodb://localhost:27017/")
@@ -140,12 +141,49 @@ def generar_respuesta_ollama(cliente_id, asesor, area):
     guardar_mensaje(cliente_id, "assistant", texto, asesor)
     return texto
 
-# --- API ---
+# --- Generar token de confirmación ---
+def generar_token():
+    return str(uuid4())
+
+# --- FastAPI ---
 app = FastAPI()
 
 class Mensaje(BaseModel):
     cliente_id: str
     texto: str
+
+# Endpoint para confirmar al cliente
+@app.get("/confirmar/{token}")
+def confirmar_cliente(token: str):
+    estado = estado_col.find_one({"token_confirmacion": token, "confirmado": False})
+    if not estado:
+        raise HTTPException(status_code=404, detail="Token inválido o ya confirmado")
+    
+    estado_col.update_one(
+        {"_id": estado["_id"]},
+        {"$set": {"confirmado": True, "fecha_confirmacion": datetime.now()}}
+    )
+    return {"mensaje": f"Cliente {estado.get('nombre','')} confirmado como atendido por {estado.get('asesor','')}"}
+
+# Cron job simulado: reasignar clientes no confirmados
+def reasignar_pendientes(minutos=5):
+    tiempo_limite = datetime.now() - timedelta(minutes=minutos)
+    pendientes = estado_col.find({"confirmado": False, "fecha_asignacion": {"$lt": tiempo_limite}})
+    
+    for lead in pendientes:
+        nuevo_asesor_doc = asignar_asesor_activo(lead["area"], exclude_asesor=lead["asesor"])
+        if nuevo_asesor_doc:
+            nuevo_token = generar_token()
+            estado_col.update_one(
+                {"_id": lead["_id"]},
+                {"$set": {
+                    "asesor": nuevo_asesor_doc["nombre"],
+                    "fecha_asignacion": datetime.now(),
+                    "token_confirmacion": nuevo_token
+                }}
+            )
+            # Aquí envías el mensaje al nuevo asesor con el nuevo link
+            print(f"Cliente {lead['nombre']} reasignado a {nuevo_asesor_doc['nombre']} con link /confirmar/{nuevo_token}")
 
 @app.post("/webhook")
 def webhook(msg: Mensaje):
@@ -189,7 +227,21 @@ def webhook(msg: Mensaje):
         if not asesor_doc:
             return {"respuesta": f"No hay asesores disponibles en {area} en este momento."}
 
-        actualizar_estado(msg.cliente_id, {"area": area, "asesor": asesor_doc["nombre"], "paso": "chat"})
+        # Generar token de confirmación para el asesor
+        token = generar_token()
+        actualizar_estado(msg.cliente_id, {
+            "area": area,
+            "asesor": asesor_doc["nombre"],
+            "paso": "chat",
+            "fecha_asignacion": datetime.now(),
+            "token_confirmacion": token,
+            "confirmado": False
+        })
+
+        # Aquí envías mensaje al asesor con el link
+        link_confirmacion = f"https://midominio.com/confirmar/{token}"
+        print(f"Envía al asesor {asesor_doc['nombre']} el link: {link_confirmacion}")
+
         return {"respuesta": random.choice(frases_canalizacion).format(
             nombre=estado.get("nombre", ""),
             area=area,
@@ -198,10 +250,19 @@ def webhook(msg: Mensaje):
         )}
 
     if paso == "chat":
-        if verificar_respuesta_asesor(msg.cliente_id):
+        # Reasignar si el asesor no confirmó
+        tiempo_limite = datetime.now() - timedelta(minutes=5)
+        if not estado.get("confirmado") and estado.get("fecha_asignacion") < tiempo_limite:
             nuevo_asesor_doc = asignar_asesor_activo(estado["area"], exclude_asesor=estado["asesor"])
             if nuevo_asesor_doc:
-                actualizar_estado(msg.cliente_id, {"asesor": nuevo_asesor_doc["nombre"]})
+                nuevo_token = generar_token()
+                actualizar_estado(msg.cliente_id, {
+                    "asesor": nuevo_asesor_doc["nombre"],
+                    "fecha_asignacion": datetime.now(),
+                    "token_confirmacion": nuevo_token
+                })
+                link_confirmacion = f"https://midominio.com/confirmar/{nuevo_token}"
+                print(f"Reasignando al cliente {estado.get('nombre')} al asesor {nuevo_asesor_doc['nombre']} con link {link_confirmacion}")
                 return {"respuesta": random.choice(frases_reasignacion).format(
                     nombre=estado["nombre"],
                     asesor=estado["asesor"],
@@ -212,7 +273,9 @@ def webhook(msg: Mensaje):
             else:
                 return {"respuesta": f"No hay más asesores disponibles en {estado['area']} en este momento."}
 
+        # Generar respuesta con Ollama
         return {"respuesta": generar_respuesta_ollama(msg.cliente_id, estado["asesor"], estado["area"])}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=5000)
