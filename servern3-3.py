@@ -6,11 +6,12 @@ from apscheduler.schedulers.background import BackgroundScheduler
 import random
 import requests
 import logging
+import ollama
 
 # =========================
-# Configuración / Logging
+# Logging
 # =========================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # =========================
@@ -25,21 +26,19 @@ bitacora_col = db["bitacora"]
 
 BOT_NOMBRE = "Alex"
 AGENCIA = "Volkswagen Eurocity Culiacan"
-
-# Lista de ejecutivos disponibles
 EJECUTIVOS = ["ejecutivo1", "ejecutivo2", "ejecutivo3"]
 
 # =========================
-# Modelos Pydantic
+# Pydantic model
 # =========================
 class Mensaje(BaseModel):
     cliente_id: str
     texto: str
 
 # =========================
-# Funciones de obtención de autos
+# Funciones de autos
 # =========================
-def obtener_autos_nuevos(force_refresh: bool = False) -> list[str]:
+def obtener_autos_nuevos(force_refresh: bool = False):
     try:
         ahora = datetime.utcnow()
         cache = cache_col.find_one({"_id": "autos_nuevos"})
@@ -51,26 +50,14 @@ def obtener_autos_nuevos(force_refresh: bool = False) -> list[str]:
         res = requests.post(url, data=payload, timeout=10)
         res.raise_for_status()
         data = res.json()
-
-        modelos_unicos = set()
-        autos = []
-        for auto in data:
-            modelo = auto.get("modelo")
-            if modelo and modelo not in modelos_unicos:
-                modelos_unicos.add(modelo)
-                autos.append(modelo)
-
-        cache_col.update_one(
-            {"_id": "autos_nuevos"},
-            {"$set": {"data": autos, "ts": ahora}},
-            upsert=True
-        )
+        autos = list({auto.get("modelo") for auto in data if auto.get("modelo")})
+        cache_col.update_one({"_id": "autos_nuevos"}, {"$set": {"data": autos, "ts": ahora}}, upsert=True)
         return autos
     except Exception as e:
-        logger.error(f"Error obteniendo autos nuevos: {e}")
+        logger.error(f"Error autos nuevos: {e}")
         return []
 
-def obtener_autos_usados(force_refresh: bool = False) -> list[str]:
+def obtener_autos_usados(force_refresh: bool = False):
     try:
         ahora = datetime.utcnow()
         cache = cache_col.find_one({"_id": "autos_usados"})
@@ -78,40 +65,20 @@ def obtener_autos_usados(force_refresh: bool = False) -> list[str]:
             return cache.get("data", [])
 
         url = "https://vw-eurocity.com.mx/SeminuevosMotorV3/info/consultas.aspx"
-        headers_usados = {
-            "X-Requested-With": "XMLHttpRequest",
-            "User-Agent": "Mozilla/5.0",
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            "Origin": "https://vw-eurocity.com.mx",
-            "Referer": "https://vw-eurocity.com.mx/Seminuevos/",
-        }
+        headers = {"User-Agent": "Mozilla/5.0"}
         payload = {"r": "CheckDist"}
-        res = requests.post(url, headers=headers_usados, data=payload, timeout=10)
+        res = requests.post(url, headers=headers, data=payload, timeout=10)
         res.raise_for_status()
         data = res.json()
-
-        autos = []
-        vistos = set()
-        for auto in data.get("LiAutos", []):
-            modelo = auto.get("Modelo")
-            anio = auto.get("Anio")
-            clave = f"{modelo}-{anio}"
-            if modelo and anio and clave not in vistos:
-                vistos.add(clave)
-                autos.append(f"{modelo} ({anio})")
-
-        cache_col.update_one(
-            {"_id": "autos_usados"},
-            {"$set": {"data": autos, "ts": ahora}},
-            upsert=True
-        )
+        autos = list({f"{auto.get('Modelo')} ({auto.get('Anio')})" for auto in data.get("LiAutos", []) if auto.get("Modelo")})
+        cache_col.update_one({"_id": "autos_usados"}, {"$set": {"data": autos, "ts": ahora}}, upsert=True)
         return autos
     except Exception as e:
-        logger.error(f"Error obteniendo autos usados: {e}")
+        logger.error(f"Error autos usados: {e}")
         return []
 
 # =========================
-# Funciones de sesión y bitácora
+# Sesiones / bitácora
 # =========================
 def obtener_sesion(cliente_id):
     sesion = sesiones_col.find_one({"cliente_id": cliente_id})
@@ -127,14 +94,12 @@ def guardar_bitacora(registro):
     bitacora_col.insert_one(registro)
 
 # =========================
-# Función para asignar ejecutivo
+# Asignación ejecutivo
 # =========================
 def asignar_ejecutivo(cliente_id, info_cliente):
     for ejecutivo in EJECUTIVOS:
-        # Simulación de disponibilidad: se puede reemplazar por API real
         disponible = True
         if disponible:
-            # Guardamos en bitácora la asignación
             guardar_bitacora({
                 "cliente_id": cliente_id,
                 "ejecutivo": ejecutivo,
@@ -145,7 +110,18 @@ def asignar_ejecutivo(cliente_id, info_cliente):
     return None
 
 # =========================
-# Webhook principal
+# Generación de respuesta humana con Ollama
+# =========================
+def generar_respuesta_ollama(prompt_base: str) -> str:
+    try:
+        response = ollama.generate(model="llama3", prompt=prompt_base)
+        return response["response"].strip()
+    except Exception as e:
+        logger.error(f"Error Ollama: {e}")
+        return "Disculpa, tuve un problema procesando tu mensaje."
+
+# =========================
+# Webhook
 # =========================
 @app.post("/webhook")
 async def webhook(req: Mensaje):
@@ -153,15 +129,17 @@ async def webhook(req: Mensaje):
     texto = req.texto.lower()
     sesion = obtener_sesion(cliente_id)
 
-    # 1️⃣ Obtener nombre si no está
+    # 1️⃣ Obtener nombre
     if "nombre" not in sesion:
         palabras = [p for p in texto.split() if p.isalpha()]
         if palabras:
             sesion["nombre"] = palabras[0].title()
         else:
-            return {"texto": f"👋 ¡Hola! Bienvenido a {AGENCIA}. ¿Cómo te llamas?", "botones": []}
+            guardar_sesion(cliente_id, sesion)
+            prompt = f"Hola, inicia una conversación amigable y natural para conseguir el nombre del cliente."
+            return {"texto": generar_respuesta_ollama(prompt), "botones": []}
 
-    # 2️⃣ Preguntar tipo de auto si falta
+    # 2️⃣ Tipo de auto
     if "tipo_auto" not in sesion:
         if "nuevo" in texto:
             sesion["tipo_auto"] = "nuevo"
@@ -169,55 +147,45 @@ async def webhook(req: Mensaje):
             sesion["tipo_auto"] = "usado"
         else:
             guardar_sesion(cliente_id, sesion)
-            return {"texto": f"Hola {sesion['nombre']}, ¿buscas un auto nuevo o usado?", "botones": ["Nuevo", "Usado"]}
+            prompt = f"{sesion['nombre']} está interactuando. Pregunta de forma amistosa si busca un auto nuevo o usado."
+            return {"texto": generar_respuesta_ollama(prompt), "botones": ["Nuevo", "Usado"]}
 
-    # 3️⃣ Obtener lista de modelos según tipo
+    # 3️⃣ Obtener modelos según tipo
     tipo = sesion["tipo_auto"]
-    if tipo == "nuevo":
-        modelos = obtener_autos_nuevos()
-    else:
-        modelos = obtener_autos_usados()
-
+    modelos = obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados()
     sesion["modelos"] = modelos
 
     # 4️⃣ Detectar modelo mencionado
-    modelo_seleccionado = None
-    for m in modelos:
-        if m.lower() in texto:
-            modelo_seleccionado = m
-            break
+    modelo_seleccionado = next((m for m in modelos if m.lower() in texto), None)
 
-    # 5️⃣ Confirmar modelo con cliente
+    # 5️⃣ Confirmar modelo con Ollama
     if "modelo_confirmado" not in sesion:
         if modelo_seleccionado:
             sesion["modelo"] = modelo_seleccionado
             guardar_sesion(cliente_id, sesion)
-            return {"texto": f"Perfecto {sesion['nombre']}, confirmas que el modelo que quieres es {modelo_seleccionado}? 🤔", "botones": ["Sí", "Cambiar modelo"]}
+            prompt = f"Confirma amablemente con {sesion['nombre']} que quiere el modelo {modelo_seleccionado}, y ofrece opción de cambiarlo."
+            return {"texto": generar_respuesta_ollama(prompt), "botones": ["Sí", "Cambiar modelo"]}
         else:
             guardar_sesion(cliente_id, sesion)
-            return {"texto": f"{sesion['nombre']}, estos son los modelos de {tipo} disponibles:\n- " + "\n- ".join(modelos[:10]), "botones": modelos[:5]}
+            prompt = f"{sesion['nombre']} necesita elegir un modelo. Muestra de forma natural los primeros 5 modelos de la lista: {', '.join(modelos[:5])}."
+            return {"texto": generar_respuesta_ollama(prompt), "botones": modelos[:5]}
 
-    # 6️⃣ Confirmación final y asignación a ejecutivo
+    # 6️⃣ Confirmación final y asignación ejecutivo
     if texto in ["sí", "si"]:
-        info_cliente = {
-            "nombre": sesion["nombre"],
-            "tipo_auto": tipo,
-            "modelo": sesion["modelo"],
-            "whatsapp": cliente_id
-        }
+        info_cliente = {"nombre": sesion["nombre"], "tipo_auto": tipo, "modelo": sesion["modelo"], "whatsapp": cliente_id}
         ejecutivo = asignar_ejecutivo(cliente_id, info_cliente)
         guardar_sesion(cliente_id, sesion)
-        return {
-            "texto": f"✅ Gracias {sesion['nombre']}! Un ejecutivo de ventas te contactará en breve. {ejecutivo} se hará cargo de tu solicitud.",
-            "botones": []
-        }
+        prompt = f"Avisa de forma cordial a {sesion['nombre']} que un ejecutivo ({ejecutivo}) lo contactará en breve."
+        return {"texto": generar_respuesta_ollama(prompt), "botones": []}
     elif texto in ["cambiar modelo"]:
         sesion.pop("modelo", None)
         guardar_sesion(cliente_id, sesion)
-        return {"texto": "De acuerdo, elige otro modelo de la lista:", "botones": modelos[:5]}
+        prompt = f"{sesion['nombre']} quiere cambiar de modelo, muestra de forma natural los primeros 5 modelos: {', '.join(modelos[:5])}."
+        return {"texto": generar_respuesta_ollama(prompt), "botones": modelos[:5]}
 
     guardar_sesion(cliente_id, sesion)
-    return {"texto": "Estoy aquí para ayudarte a elegir el modelo perfecto. 😉", "botones": modelos[:5]}
+    prompt = f"{sesion['nombre']} continúa la conversación. Genera respuesta humana para guiarlo a seleccionar modelo."
+    return {"texto": generar_respuesta_ollama(prompt), "botones": modelos[:5]}
 
 # =========================
 # Scheduler refresco cache
