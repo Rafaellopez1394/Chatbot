@@ -1,255 +1,192 @@
 from fastapi import FastAPI, Request
+from pydantic import BaseModel
 from pymongo import MongoClient
-from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
-import requests
-from bs4 import BeautifulSoup
-import re
-import random
-import ollama
+from datetime import datetime, timedelta
+import requests, random, logging, re
+import ollama  # Para generar respuestas más humanas
 
 # =====================
-# Configuración general
+# Configuración / Logging
+# =====================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =====================
+# Base de datos
 # =====================
 app = FastAPI()
 client = MongoClient("mongodb://localhost:27017/")
-db = client["autos_db"]
+db = client["chatbot_db"]
+cache_col = db["cache"]
+sesiones_col = db["sesiones"]
+bitacora_col = db["bitacora"]
 
 BOT_NOMBRE = "Alex"
-AGENCIA = "Volkswagen Eurocity Culiacán"
+AGENCIA = "Volkswagen Eurocity Culiacan"
 
 # =====================
-# Funciones de scraping
+# Modelos Pydantic
 # =====================
-def scrape_autos(urls, selector):
-    autos = []
-    for url in urls:
-        try:
-            res = requests.get(url, timeout=10)
-            res.raise_for_status()
-            soup = BeautifulSoup(res.text, "html.parser")
-            for car in soup.select(selector):
-                texto = car.get_text(strip=True)
-                if texto and texto not in autos:
-                    autos.append(texto)
-        except Exception as e:
-            print(f"⚠️ Error al scrapear {url}: {e}")
-    return autos
+class Mensaje(BaseModel):
+    cliente_id: str
+    texto: str
 
-def actualizar_cache(tipo, urls, selector):
-    modelos = scrape_autos(urls, selector)
-    if modelos:
-        db.cache.update_one(
-            {"tipo": tipo},
-            {"$set": {"modelos": modelos, "fecha": datetime.now()}},
-            upsert=True
-        )
-        print(f"[{tipo}] ✅ Cache actualizado con {len(modelos)} modelos.")
-    return modelos
+# =====================
+# Funciones de obtención de autos
+# =====================
+def obtener_autos_nuevos(force_refresh: bool = False):
+    try:
+        ahora = datetime.utcnow()
+        cache = cache_col.find_one({"_id": "autos_nuevos"})
+        if not force_refresh and cache and (ahora - cache.get("ts", ahora) < timedelta(hours=3)):
+            return cache.get("data", [])
 
-def obtener_cache(tipo):
-    cache = db.cache.find_one({"tipo": tipo})
-    if cache and cache["fecha"] > datetime.now() - timedelta(hours=6):
-        return cache["modelos"]
+        url = "https://vw-eurocity.com.mx/info/consultas.ashx"
+        payload = {"r": "cargaAutosTodos", "x": str(random.random())}
+        headers = {"User-Agent": "Mozilla/5.0"}
+        res = requests.post(url, data=payload, headers=headers, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        modelos = list({auto.get("modelo") for auto in data if auto.get("modelo")})
+        cache_col.update_one({"_id": "autos_nuevos"}, {"$set": {"data": modelos, "ts": ahora}}, upsert=True)
+        return modelos
+    except Exception as e:
+        logger.error(f"Error obteniendo autos nuevos: {e}")
+        return []
+
+def obtener_autos_usados(force_refresh: bool = False):
+    try:
+        ahora = datetime.utcnow()
+        cache = cache_col.find_one({"_id": "autos_usados"})
+        if not force_refresh and cache and (ahora - cache.get("ts", ahora) < timedelta(hours=3)):
+            return cache.get("data", [])
+
+        url = "https://vw-eurocity.com.mx/SeminuevosMotorV3/info/consultas.aspx"
+        headers = {
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": "Mozilla/5.0",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://vw-eurocity.com.mx",
+            "Referer": "https://vw-eurocity.com.mx/Seminuevos/",
+        }
+        payload = {"r": "CheckDist"}
+        res = requests.post(url, headers=headers, data=payload, timeout=10)
+        res.raise_for_status()
+        data = res.json()
+        autos = []
+        vistos = set()
+        for auto in data.get("LiAutos", []):
+            modelo, anio = auto.get("Modelo"), auto.get("Anio")
+            clave = f"{modelo}-{anio}"
+            if modelo and anio and clave not in vistos:
+                vistos.add(clave)
+                autos.append({"modelo": modelo, "anio": anio})
+        cache_col.update_one({"_id": "autos_usados"}, {"$set": {"data": autos, "ts": ahora}}, upsert=True)
+        return autos
+    except Exception as e:
+        logger.error(f"Error obteniendo autos usados: {e}")
+        return []
+
+# =====================
+# Funciones de sesión y bitácora
+# =====================
+def obtener_sesion(cliente_id):
+    sesion = sesiones_col.find_one({"cliente_id": cliente_id})
+    return sesion if sesion else {}
+
+def guardar_sesion(cliente_id, sesion):
+    sesion["cliente_id"] = cliente_id
+    sesion["fecha"] = datetime.now()
+    sesiones_col.update_one({"cliente_id": cliente_id}, {"$set": sesion}, upsert=True)
+
+def guardar_bitacora(datos):
+    datos["fecha"] = datetime.now()
+    bitacora_col.insert_one(datos)
+
+# =====================
+# Ejecutivos
+# =====================
+EJECUTIVOS = [{"nombre": "Pedro", "whatsapp": "+5215512345678"},
+              {"nombre": "Ana", "whatsapp": "+5215512345679"}]
+
+async def asignar_ejecutivo(cliente):
+    for ejecutivo in EJECUTIVOS:
+        disponible = True  # Lógica real de confirmación puede ir aquí
+        if disponible:
+            guardar_bitacora({
+                "cliente": cliente["nombre"],
+                "telefono": cliente["telefono"],
+                "modelo": cliente["modelo"],
+                "ejecutivo": ejecutivo["nombre"],
+                "asignado": True
+            })
+            return ejecutivo
     return None
 
 # =====================
-# Funciones de sesión
+# Funciones de parsing
 # =====================
-def guardar_sesion(cliente_id, estado):
-    estado["cliente_id"] = cliente_id
-    estado["fecha"] = datetime.now()
-    db.sesiones.update_one(
-        {"cliente_id": cliente_id},
-        {"$set": estado},
-        upsert=True
-    )
-
-def obtener_sesion(cliente_id):
-    sesion = db.sesiones.find_one({"cliente_id": cliente_id})
-    if sesion:
-        return sesion
-    return {}
-
-# =====================
-# Scheduler automático
-# =====================
-scheduler = BackgroundScheduler()
-
-def refrescar_todos():
-    print("♻️ Refrescando cache de autos...")
-    actualizar_cache(
-        "autos_nuevos",
-        [
-            "https://www.autocosmos.com.mx/vweurocity/autos",
-            "https://www.autocosmos.com.mx/vweurocity/autos?pidx=2"
-        ],
-        ".anuncio h3"
-    )
-    actualizar_cache(
-        "autos_usados",
-        [
-            "https://vw-eurocity.com.mx/seminuevos"
-        ],
-        ".anuncio h3"
-    )
-
-scheduler.add_job(refrescar_todos, "interval", hours=6)
-scheduler.start()
-
-# =====================
-# Parser de nombre y tipo auto
-# =====================
-NOMBRE_REGEXES = [r"(?:^|\b)(?:mi nombre es|me llamo|soy)\s+([a-záéíóúñ]+)"]
-
-def parsear_nombre_tipo(texto: str):
-    texto = texto.lower().strip()
-    nombre = None
-    tipo_auto = None
-
-    # Extraer nombre si el usuario lo indica
-    for patron in NOMBRE_REGEXES:
-        m = re.search(patron, texto, re.IGNORECASE)
-        if m:
-            candidato = m.group(1).strip()
-            if candidato and candidato not in ("soy", "me", "llamo"):
-                nombre = candidato.title()
+def parsear_nombre_modelo(texto, sesion):
+    palabras = texto.lower().split()
+    # Nombre
+    if "nombre" not in sesion:
+        for palabra in palabras:
+            if palabra.isalpha() and palabra not in {"hola","ok","sí","si","gracias"}:
+                sesion["nombre"] = palabra.title()
                 break
-
-    # Detectar tipo de auto
-    if "nuevo" in texto:
-        tipo_auto = "nuevo"
-    elif "usado" in texto:
-        tipo_auto = "usado"
-
-    return nombre, tipo_auto
+    # Modelo
+    if "modelo" not in sesion:
+        modelos = obtener_autos_nuevos() if sesion.get("tipo_auto")=="nuevo" else [a["modelo"] for a in obtener_autos_usados()]
+        for modelo in modelos:
+            if modelo.lower() in texto.lower():
+                sesion["modelo"] = modelo
+                break
+    return sesion
 
 # =====================
-# Generación de respuesta dinámica con LLM
+# Función para generar respuesta humana
 # =====================
-def generar_respuesta_llm(nombre, tipo_auto, modelos, modelo_elegido, texto_usuario):
-    prompt = f"""
-Eres {BOT_NOMBRE}, un asistente humano y amistoso de {AGENCIA}. 
-Responde de forma natural, humana y cercana al usuario. 
-Incluye emojis si es apropiado. 
-No repitas frases exactas, varía tu estilo. 
-Usa el nombre del usuario si lo sabes: {nombre if nombre else 'amigo'}.
-
-Información disponible:
-- Tipo de auto que busca el usuario: {tipo_auto if tipo_auto else 'no especificado'}
-- Modelos disponibles: {', '.join(modelos[:10]) if modelos else 'no hay información'}
-- Modelo elegido: {modelo_elegido if modelo_elegido else 'no ha elegido'}
-
-Usuario escribió: "{texto_usuario}"
-
-Genera un mensaje amable, natural y humano para el usuario.
-"""
-    response = ollama.generate(model="llama3", prompt=prompt)
+def generar_respuesta_humana(sesion, texto_usuario):
+    prompt_base = f"""
+    Eres un asistente de ventas humano y amable para Volkswagen Eurocity Culiacán llamado {BOT_NOMBRE}.
+    Conversación actual:
+    Cliente: {texto_usuario}
+    Sesión: {sesion}
+    Genera una respuesta natural y cálida, preguntando nombre o modelo si faltan, confirmando datos antes de enviar a un ejecutivo, y usando lenguaje cercano.
+    """
+    response = ollama.generate(model="llama3", prompt=prompt_base)
     return response["response"].strip()
 
 # =====================
 # Webhook principal
 # =====================
 @app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
-    cliente_id = data.get("cliente_id")
-    texto_usuario = data.get("texto", "").strip()
+async def webhook(req: Mensaje):
+    cliente_id = req.cliente_id
+    texto = req.texto.strip()
     sesion = obtener_sesion(cliente_id)
 
-    # Manejo de "Cambiar modelo"
-    if texto_usuario.lower() in ["cambiar modelo", "cambiar modelos"]:
-        tipo = sesion.get("tipo_auto")
-        modelos = sesion.get("modelos")
-        if not modelos:
-            if tipo == "nuevo":
-                modelos = obtener_cache("autos_nuevos") or actualizar_cache(
-                    "autos_nuevos",
-                    [
-                        "https://www.autocosmos.com.mx/vweurocity/autos",
-                        "https://www.autocosmos.com.mx/vweurocity/autos?pidx=2"
-                    ],
-                    ".anuncio h3"
-                )
-            else:
-                modelos = obtener_cache("autos_usados") or actualizar_cache(
-                    "autos_usados",
-                    [
-                        "https://vw-eurocity.com.mx/seminuevos"
-                    ],
-                    ".anuncio h3"
-                )
-            sesion["modelos"] = modelos
-        sesion.pop("modelo_elegido", None)
-        guardar_sesion(cliente_id, sesion)
-        return {
-            "texto": f"🚘 {sesion.get('nombre','amigo')}, elige nuevamente tu modelo de {tipo}:",
-            "botones": modelos[:5]
-        }
-
-    # Parsear nombre y tipo de auto
-    nombre_parseado, tipo_parseado = parsear_nombre_tipo(texto_usuario)
-    if nombre_parseado:
-        sesion["nombre"] = nombre_parseado
-    if tipo_parseado:
-        sesion["tipo_auto"] = tipo_parseado
-
-    # Preguntar tipo de auto si falta
-    if "tipo_auto" not in sesion:
-        guardar_sesion(cliente_id, sesion)
-        return {
-            "texto": f"👋 ¡Hola {sesion.get('nombre','amigo')}! ¿Buscas un auto *nuevo* o *usado*?",
-            "botones": ["Autos nuevos", "Autos usados"]
-        }
-
-    # Obtener modelos disponibles
-    tipo = sesion["tipo_auto"]
-    if tipo == "nuevo":
-        modelos = obtener_cache("autos_nuevos") or actualizar_cache(
-            "autos_nuevos",
-            [
-                "https://www.autocosmos.com.mx/vweurocity/autos",
-                "https://www.autocosmos.com.mx/vweurocity/autos?pidx=2"
-            ],
-            ".anuncio h3"
-        )
-    else:
-        modelos = obtener_cache("autos_usados") or actualizar_cache(
-            "autos_usados",
-            [
-                "https://vw-eurocity.com.mx/seminuevos"
-            ],
-            ".anuncio h3"
-        )
-    sesion["modelos"] = modelos
-
-    # Detectar modelo elegido
-    modelo_elegido = None
-    for m in modelos:
-        if m.lower() in texto_usuario.lower():
-            modelo_elegido = m
-            sesion["modelo_elegido"] = modelo_elegido
-            break
-
+    # Parsear nombre y modelo
+    sesion = parsear_nombre_modelo(texto, sesion)
     guardar_sesion(cliente_id, sesion)
 
-    # Generar respuesta humana dinámica
-    texto_respuesta = generar_respuesta_llm(
-        sesion.get("nombre"),
-        sesion.get("tipo_auto"),
-        modelos,
-        sesion.get("modelo_elegido"),
-        texto_usuario
-    )
+    # Generar respuesta humana
+    respuesta = generar_respuesta_humana(sesion, texto)
 
-    return {
-        "texto": texto_respuesta,
-        "botones": modelos[:5] if not modelo_elegido else ["Cambiar modelo", "Explorar más modelos"]
-    }
+    # Confirmación final y asignación
+    if "nombre" in sesion and "modelo" in sesion and not sesion.get("confirmado"):
+        sesion["confirmado"] = True
+        guardar_sesion(cliente_id, sesion)
+        cliente = {"nombre": sesion["nombre"], "telefono": cliente_id, "modelo": sesion["modelo"]}
+        ejecutivo = await asignar_ejecutivo(cliente)
+        if ejecutivo:
+            respuesta += f"\n\n¡Excelente! Un ejecutivo ({ejecutivo['nombre']}) te contactará pronto vía WhatsApp."
+        else:
+            respuesta += "\n\nTodos nuestros ejecutivos están ocupados, te contactaremos en cuanto sea posible."
 
-# =====================
-# Main
-# =====================
+    return {"texto": respuesta}
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=5000)
