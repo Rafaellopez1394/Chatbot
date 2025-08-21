@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from pydantic import BaseModel
 from pymongo import MongoClient
 from datetime import datetime, timedelta
@@ -7,6 +7,7 @@ import random
 import requests
 import logging
 import ollama
+import asyncio
 
 # =========================
 # Logging
@@ -27,6 +28,7 @@ bitacora_col = db["bitacora"]
 BOT_NOMBRE = "Alex"
 AGENCIA = "Volkswagen Eurocity Culiacán"
 EJECUTIVOS = ["ejecutivo1", "ejecutivo2", "ejecutivo3"]
+TIEMPO_ESPERA_MIN = 3  # tiempo máximo de espera por ejecutivo
 
 # =========================
 # Pydantic model
@@ -36,7 +38,7 @@ class Mensaje(BaseModel):
     texto: str
 
 # =========================
-# Funciones de autos
+# Funciones auxiliares
 # =========================
 def obtener_autos_nuevos(force_refresh: bool = False):
     try:
@@ -75,9 +77,14 @@ def obtener_autos_usados(force_refresh: bool = False):
         logger.error(f"Error autos usados: {e}")
         return []
 
-# =========================
-# Sesiones / bitácora
-# =========================
+def generar_respuesta_ollama(prompt_base: str) -> str:
+    try:
+        response = ollama.generate(model="llama3", prompt=prompt_base)
+        return response["response"].strip()
+    except Exception as e:
+        logger.error(f"Error Ollama: {e}")
+        return "Disculpa, tuve un problema procesando tu mensaje."
+
 def obtener_sesion(cliente_id):
     sesion = sesiones_col.find_one({"cliente_id": cliente_id})
     return sesion if sesion else {}
@@ -92,12 +99,20 @@ def guardar_bitacora(registro):
     bitacora_col.insert_one(registro)
 
 # =========================
-# Asignación ejecutivo con reintentos
+# Asignación con reintentos
 # =========================
-def asignar_ejecutivo(cliente_id, info_cliente, tiempo_espera_min=3):
+async def asignar_ejecutivo_con_reintentos(cliente_id, info_cliente):
     for ejecutivo in EJECUTIVOS:
-        # Lógica de disponibilidad simulada
-        # Aquí podrías agregar verificación real de disponibilidad
+        guardar_bitacora({
+            "cliente_id": cliente_id,
+            "ejecutivo": ejecutivo,
+            "info_cliente": info_cliente,
+            "estatus": "intentando"
+        })
+        # Simular espera de respuesta del ejecutivo
+        await asyncio.sleep(TIEMPO_ESPERA_MIN * 60)  # espera en segundos
+        # Supongamos que siempre responde el primer ejecutivo
+        info_cliente["ejecutivo_asignado"] = ejecutivo
         guardar_bitacora({
             "cliente_id": cliente_id,
             "ejecutivo": ejecutivo,
@@ -108,18 +123,7 @@ def asignar_ejecutivo(cliente_id, info_cliente, tiempo_espera_min=3):
     return None
 
 # =========================
-# Generación de respuesta humana con Ollama
-# =========================
-def generar_respuesta_ollama(prompt_base: str) -> str:
-    try:
-        response = ollama.generate(model="llama3", prompt=prompt_base)
-        return response["response"].strip()
-    except Exception as e:
-        logger.error(f"Error Ollama: {e}")
-        return "Disculpa, tuve un problema procesando tu mensaje."
-
-# =========================
-# Webhook ultra-humano
+# Webhook humano
 # =========================
 @app.post("/webhook")
 async def webhook(req: Mensaje):
@@ -127,21 +131,17 @@ async def webhook(req: Mensaje):
     texto = req.texto.lower()
     sesion = obtener_sesion(cliente_id)
 
-    # -------------------------
-    # 1️⃣ Obtener nombre
-    # -------------------------
+    # 1️⃣ Nombre
     if "nombre" not in sesion:
         palabras = [p for p in texto.split() if p.isalpha()]
         if palabras:
             sesion["nombre"] = palabras[0].title()
         else:
             guardar_sesion(cliente_id, sesion)
-            prompt = "Inicia conversación amistosa para que el cliente me diga su nombre."
+            prompt = "Inicia conversación amistosa para obtener el nombre del cliente."
             return {"texto": generar_respuesta_ollama(prompt), "botones": []}
 
-    # -------------------------
-    # 2️⃣ Preguntar tipo de auto
-    # -------------------------
+    # 2️⃣ Tipo de auto
     if "tipo_auto" not in sesion:
         if "nuevo" in texto:
             sesion["tipo_auto"] = "nuevo"
@@ -149,38 +149,30 @@ async def webhook(req: Mensaje):
             sesion["tipo_auto"] = "usado"
         else:
             guardar_sesion(cliente_id, sesion)
-            prompt = f"{sesion['nombre']} está interactuando. Pregunta si busca auto nuevo o usado de forma natural."
+            prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
             return {"texto": generar_respuesta_ollama(prompt), "botones": ["Nuevo", "Usado"]}
 
-    # -------------------------
-    # 3️⃣ Obtener modelos según tipo
-    # -------------------------
+    # 3️⃣ Modelos
     tipo = sesion["tipo_auto"]
     modelos = obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados()
     sesion["modelos"] = modelos
 
-    # -------------------------
-    # 4️⃣ Detectar modelo mencionado
-    # -------------------------
+    # 4️⃣ Detectar modelo
     modelo_seleccionado = next((m for m in modelos if m.lower() in texto), None)
 
-    # -------------------------
-    # 5️⃣ Confirmación con cliente
-    # -------------------------
+    # 5️⃣ Confirmar modelo
     if "modelo_confirmado" not in sesion:
         if modelo_seleccionado:
             sesion["modelo"] = modelo_seleccionado
             guardar_sesion(cliente_id, sesion)
-            prompt = f"Confirma amablemente con {sesion['nombre']} que desea el modelo {modelo_seleccionado}. Ofrece opción de cambiarlo."
+            prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {modelo_seleccionado}? Ofrece cambiarlo si desea."
             return {"texto": generar_respuesta_ollama(prompt), "botones": ["Sí", "Cambiar modelo"]}
         else:
             guardar_sesion(cliente_id, sesion)
-            prompt = f"{sesion['nombre']} necesita elegir un modelo. Muestra de forma natural los primeros 5 modelos: {', '.join(modelos[:5])}."
+            prompt = f"{sesion['nombre']}, elige un modelo de los siguientes: {', '.join(modelos[:5])}."
             return {"texto": generar_respuesta_ollama(prompt), "botones": modelos[:5]}
 
-    # -------------------------
-    # 6️⃣ Confirmación final y asignación ejecutivo
-    # -------------------------
+    # 6️⃣ Confirmación final y asignación
     if texto in ["sí", "si"]:
         info_cliente = {
             "nombre": sesion["nombre"],
@@ -188,21 +180,22 @@ async def webhook(req: Mensaje):
             "modelo": sesion["modelo"],
             "whatsapp": cliente_id
         }
-        ejecutivo = asignar_ejecutivo(cliente_id, info_cliente)
+        # Notificar al cliente que será atendido
+        prompt_cliente = f"{sesion['nombre']}, gracias por la información. Un ejecutivo de ventas te contactará en breve para ayudarte con tu modelo {sesion['modelo']}."
+        # Ejecutar asignación con reintentos
+        ejecutivo = await asignar_ejecutivo_con_reintentos(cliente_id, info_cliente)
         guardar_sesion(cliente_id, sesion)
-        prompt = f"Amablemente informa a {sesion['nombre']} que un ejecutivo ({ejecutivo}) lo contactará en breve para ayudarlo con su modelo {sesion['modelo']}."
-        return {"texto": generar_respuesta_ollama(prompt), "botones": []}
+        return {"texto": generar_respuesta_ollama(prompt_cliente), "botones": []}
+
     elif texto in ["cambiar modelo"]:
         sesion.pop("modelo", None)
         guardar_sesion(cliente_id, sesion)
-        prompt = f"{sesion['nombre']} quiere cambiar de modelo. Muestra de forma natural los primeros 5 modelos: {', '.join(modelos[:5])}."
+        prompt = f"{sesion['nombre']}, selecciona nuevamente tu modelo: {', '.join(modelos[:5])}."
         return {"texto": generar_respuesta_ollama(prompt), "botones": modelos[:5]}
 
-    # -------------------------
-    # 7️⃣ Continuar conversación guiando a elegir modelo
-    # -------------------------
+    # 7️⃣ Continuar conversación
     guardar_sesion(cliente_id, sesion)
-    prompt = f"{sesion['nombre']} continúa la conversación. Genera respuesta humana para guiarlo a seleccionar modelo, usando tono cercano y amistoso."
+    prompt = f"{sesion['nombre']}, continúa la conversación de manera amistosa y persuasiva para guiarlo a elegir un modelo."
     return {"texto": generar_respuesta_ollama(prompt), "botones": modelos[:5]}
 
 # =========================
