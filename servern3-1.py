@@ -101,6 +101,44 @@ class AdvisorResponse(BaseModel):
     respuesta: str
     asesor_phone: str
 
+def obtener_catalogo_modelos_cache(force_refresh: bool = False) -> dict:
+    """
+    Devuelve los modelos catalogados por tipo: 'nuevo' y 'usado', cargados desde cache MongoDB.
+    """
+    try:
+        ahora = datetime.utcnow()
+        catalogo_cache = cache_col.find_one({"_id": "catalogo_modelos"})
+
+        if catalogo_cache and not force_refresh and (ahora - catalogo_cache.get("ts", ahora) < timedelta(hours=3)):
+            return catalogo_cache.get("data", {"nuevo": [], "usado": []})
+
+        # Obtener autos nuevos y usados desde cache individual
+        autos_nuevos = cache_col.find_one({"_id": "autos_nuevos"})
+        autos_usados = cache_col.find_one({"_id": "autos_usados"})
+
+        modelos_nuevos = sorted(list(set(autos_nuevos.get("data", [])))) if autos_nuevos else []
+        modelos_usados = sorted(list(set(auto["modelo"] for auto in autos_usados.get("data", []) if "modelo" in auto))) if autos_usados else []
+
+        catalogo = {
+            "nuevo": modelos_nuevos,
+            "usado": modelos_usados
+        }
+
+        # Guardar en cache general
+        cache_col.update_one(
+            {"_id": "catalogo_modelos"},
+            {"$set": {"data": catalogo, "ts": ahora}},
+            upsert=True
+        )
+
+        return catalogo
+
+    except Exception as e:
+        logger.error(f"Error obteniendo catálogo de modelos desde cache: {e}")
+        # fallback mínimo
+        return {"nuevo": [], "usado": []}
+
+
 def obtener_modelos_disponibles(tipo_auto: str) -> list:
     """
     Retorna la lista de modelos disponibles según el tipo de vehículo
