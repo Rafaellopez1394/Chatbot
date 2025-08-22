@@ -130,7 +130,7 @@ def guardar_bitacora(registro):
 # ------------------------------
 # Generación de respuesta con Ollama
 # ------------------------------
-def generar_respuesta_ollama(prompt, contexto_sesion=None):
+def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=False):
     try:
         system_prompt = (
             f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente paso a paso para elegir un auto. "
@@ -140,9 +140,12 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None):
             "3) Muestra modelos disponibles según el tipo de auto, usando SOLO los modelos proporcionados en el contexto. "
             "4) Confirma el modelo seleccionado. "
             "5) Asigna un ejecutivo. "
-            "No generes respuestas genéricas, no listes modelos a menos que se indique explícitamente en el contexto, y no te desvíes del flujo. "
-            "Responde únicamente en español, de manera amigable, profesional y concisa."
+            "No uses saludos redundantes como 'Hola' o 'Me alegra' en cada mensaje, especialmente después del primer mensaje. "
+            "Responde únicamente en español, de manera directa, profesional y concisa, enfocándote en la solicitud del cliente. "
+            "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', proporciona una lista clara de documentos necesarios para la compra de un auto."
         )
+        if es_primer_mensaje:
+            system_prompt += "\nEn el primer mensaje, usa un tono de bienvenida amigable, pero sin repetir saludos en mensajes posteriores."
         if contexto_sesion:
             system_prompt += f"\nContexto actual: {contexto_sesion}"
         full_prompt = f"{system_prompt}\n\nInstrucción al cliente: {prompt}"
@@ -170,7 +173,7 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None):
 
 # ------------------------------
 # Asignación de ejecutivo con reintentos
-# ----------------------
+# ------------------------------
 async def enviar_a_ejecutivo(cliente_id, info_cliente):
     try:
         for ejecutivo in EJECUTIVOS:
@@ -215,9 +218,21 @@ async def webhook(req: Mensaje):
         # Manejar mensajes post-confirmación primero
         if "modelo_confirmado" in sesion and sesion["modelo_confirmado"]:
             logger.info(f"Sesión ya confirmada para {cliente_id}: {sesion}")
-            contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
-            prompt = f"{sesion['nombre']}, ya hemos registrado tu interés en el modelo {sesion['modelo']}. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
-            respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+            if any(keyword in texto for keyword in ["documentos", "requisitos", "papeles"]):
+                contexto = f"El cliente {sesion['nombre']} ha preguntado por documentos necesarios para la compra del modelo {sesion['modelo']}."
+                prompt = (
+                    f"{sesion['nombre']}, para la compra de tu {sesion['modelo']}, necesitarás los siguientes documentos: "
+                    "1) Identificación oficial (INE o pasaporte), "
+                    "2) Comprobante de domicilio (no mayor a 3 meses), "
+                    "3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), "
+                    "4) Solicitud de crédito (si aplica). "
+                    "Un ejecutivo te confirmará los detalles. ¿Hay algo más en lo que pueda ayudarte?"
+                )
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+            else:
+                contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
+                prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
 
@@ -242,13 +257,13 @@ async def webhook(req: Mensaje):
                 logger.info(f"Sesión existente con nombre para {cliente_id}: {sesion}")
                 contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero no ha seleccionado tipo_auto. Pregunta si quiere un auto nuevo o usado."
                 prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": ["Nuevo", "Usado"]}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             else:
                 contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
-                prompt = f"Hola, bienvenido(a) a {AGENCIA}! 👋 ¿Cómo te llamas?"
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+                prompt = f"Bienvenido(a) a {AGENCIA}! 👋 Por favor, dime cómo te llamas."
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
 
@@ -258,14 +273,14 @@ async def webhook(req: Mensaje):
                 sesion["nombre"] = palabras[0].title()
                 guardar_sesion(cliente_id, sesion)
                 contexto = f"El cliente ha proporcionado su nombre: {sesion['nombre']}. Pregunta si quiere un auto nuevo o usado."
-                prompt = f"¡Hola {sesion['nombre']}!, ¿buscas un auto nuevo o usado?"
+                prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             else:
                 contexto = "El cliente no ha proporcionado un nombre válido. Insiste en preguntar su nombre."
-                prompt = f"Hola, necesito tu nombre para ayudarte mejor. 😊 ¿Cómo te llamas?"
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+                prompt = f"Necesito tu nombre para ayudarte mejor. 😊 ¿Cómo te llamas?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
 
