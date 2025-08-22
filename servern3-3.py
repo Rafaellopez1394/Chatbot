@@ -9,6 +9,7 @@ import logging
 import ollama
 import asyncio
 from ollama import GenerateResponse
+from Levenshtein import distance as levenshtein_distance  # Requiere `pip install python-Levenshtein`
 
 # ------------------------------
 # Configuración básica
@@ -203,6 +204,12 @@ async def webhook(req: Mensaje):
     sesion = obtener_sesion(cliente_id)
 
     try:
+        # Verificar si la sesión debe reiniciarse (opcional: si han pasado más de 24 horas)
+        if sesion.get("ts") and (datetime.utcnow() - sesion["ts"]) > timedelta(hours=24):
+            logger.info(f"Sesión antigua detectada para {cliente_id}, reiniciando")
+            sesion = {}
+            guardar_sesion(cliente_id, sesion)
+
         if not texto or texto in ["hola", "hi", "buenas"]:
             contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
             prompt = f"Hola, bienvenido(a) a {AGENCIA}! 👋 ¿Cómo te llamas?"
@@ -253,6 +260,15 @@ async def webhook(req: Mensaje):
         sesion["modelos"] = modelos
         guardar_sesion(cliente_id, sesion)
 
+        # Manejar mensajes post-confirmación
+        if "modelo_confirmado" in sesion and sesion["modelo_confirmado"]:
+            logger.info(f"Sesión ya confirmada para {cliente_id}: {sesion}")
+            contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
+            prompt = f"{sesion['nombre']}, ya hemos registrado tu interés en el modelo {sesion['modelo']}. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
+            respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+            logger.info(f"Respuesta del webhook: {respuesta}")
+            return respuesta
+
         # Priorizar confirmación si ya hay un modelo seleccionado
         if "modelo" in sesion and "modelo_confirmado" not in sesion:
             logger.info(f"Verificando confirmación: texto={texto}, sesion={sesion}")
@@ -281,13 +297,18 @@ async def webhook(req: Mensaje):
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
 
-        # Selección de modelo
+        # Selección de modelo con tolerancia a errores tipográficos
         modelo_seleccionado = None
         texto_lower = texto.lower()
         for m in modelos:
             model_parts = m.lower().split()
             key_model_name = model_parts[-1] if model_parts[0] == "nuevo" else m.lower()
+            # Coincidencia exacta o parcial
             if key_model_name in texto_lower or m.lower() in texto_lower:
+                modelo_seleccionado = m
+                break
+            # Tolerancia a errores tipográficos (distancia de Levenshtein <= 2)
+            if levenshtein_distance(key_model_name, texto_lower) <= 2:
                 modelo_seleccionado = m
                 break
         logger.info(f"Modelos disponibles: {modelos}, Texto: {texto}, Modelo seleccionado: {modelo_seleccionado}")
