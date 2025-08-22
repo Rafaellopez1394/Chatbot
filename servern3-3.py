@@ -328,7 +328,7 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente de manera amigable, natural y concisa para elegir un auto. "
             "Sigue estrictamente este flujo conversacional: "
             "1) Si no tienes el nombre del cliente, responde SOLO: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me dices tu nombre, por favor?' "
-            "   Acepta nombres compuestos (e.g., 'Rafael') si son razonables. No avances sin un nombre válido (solo letras, mínimo 3 caracteres, sin palabras comunes como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehículo', 'quiero', 'busco', 'sí', 'no', 'gracias', 'q5', 'a3', 'onix', 'eclipse'). "
+            "   Acepta nombres compuestos (e.g., 'Rafael Lopez') si son razonables. No avances sin un nombre válido (solo letras, mínimo 3 caracteres, sin palabras comunes como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehículo', 'quiero', 'busco', 'sí', 'no', 'gracias', 'q5', 'a3', 'onix', 'eclipse'). "
             "   Si el nombre no es válido, responde SOLO: 'Disculpa, no entendí tu nombre. ¿Me dices cómo te llamas?' "
             "2) Si ya tienes el nombre, responde SOLO: '{nombre}, ¿buscas un auto nuevo o usado?' No avances al siguiente paso sin una respuesta clara ('nuevo' o 'usado'). "
             "3) Si ya tienes el tipo de auto, muestra los modelos con: '{nombre}, estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
@@ -336,14 +336,14 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             "   No uses emojis ni exclamaciones iniciales en esta respuesta ni en las siguientes. "
             "4) Si el cliente selecciona un modelo, pide confirmación con: '{nombre}, ¿confirmas que quieres el modelo {modelo}? Si prefieres otro, dime cuál.' "
             "5) Tras confirmar el modelo (con 'sí', 'si', 'yes', 'confirm'), responde SOLO: '{nombre}, tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto.' "
-            "Responde SOLO en español, de forma directa, amigable y profesional. "
+            "Responde SOLO en español, de forma directa, amigable y profesional. Usa siempre el nombre completo proporcionado por el cliente (e.g., 'Rafael Lopez'). "
             "Evita CUALQUIER frase técnica, redundante o exagerada como '(esperando el nombre)', 'Recuerda que solo letras', 'proporciona un nombre válido', 'excelente elección', 'absolutamente', 'sí!', '¡no!', 'me alegra ayudarte', 'auto perfecto', o 'necesito conocerte mejor'. "
             "No uses emojis ni exclamaciones iniciales (e.g., '¡{nombre}, ...') en ninguna respuesta después del mensaje inicial. "
             "Si el cliente selecciona un modelo no disponible, responde SOLO: '{nombre}, lo siento, ese modelo no está disponible. Estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
             "Si el cliente dice 'no' al confirmar un modelo, responde SOLO: '{nombre}, ¿cuál modelo prefieres? Estos son los disponibles: {modelos}.' "
             "Si el cliente expresa frustración (e.g., 'ya te dije', 'ya dije'), discúlpate y retoma el último paso: "
             "   - Si tienes nombre y tipo de auto, muestra los modelos: '{nombre}, disculpa la confusión. Estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
-            "   - If tienes solo el nombre, pregunta: '{nombre}, disculpa la confusión. ¿Buscas un auto nuevo o usado?' "
+            "   - Si tienes solo el nombre, pregunta: '{nombre}, disculpa la confusión. ¿Buscas un auto nuevo o usado?' "
             "   - Si no tienes nada, pregunta: 'Disculpa la confusión. ¿Me dices tu nombre, por favor?' "
             "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', responde SOLO: '{nombre}, para comprar tu {modelo} necesitas: 1) Identificación oficial (INE o pasaporte), 2) Comprobante de domicilio (máximo 3 meses), 3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), 4) Solicitud de crédito (si aplica). Un ejecutivo te dará más detalles. ¿Algo más en lo que pueda ayudarte?' "
             "Si el cliente pide 'hablar con un ejecutivo', verifica si tienes su nombre; si no, responde: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me dices tu nombre, por favor?' Luego, responde SOLO: '{nombre}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?' "
@@ -404,7 +404,7 @@ async def webhook(req: Mensaje):
                     "Un ejecutivo te dará más detalles. ¿Algo más en lo que pueda ayudarte?"
                 )
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
-            elif texto in ["gracias", "no, gracias", "ok", "de nada"]:
+            elif "gracias" in texto.lower() or texto in ["no, gracias", "ok", "de nada"]:
                 contexto = f"El cliente {sesion['nombre']} dijo '{texto}' después de confirmar el modelo {sesion['modelo']}."
                 prompt = f"De nada, {sesion['nombre']}. Un ejecutivo te contactará pronto."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
@@ -479,10 +479,9 @@ async def webhook(req: Mensaje):
         if "nombre" not in sesion:
             nombre_valido = None
             texto_words = texto.split()
-            if len(texto_words) >= 1:
-                nombre_candidato = " ".join(texto_words[:2])
-                if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ\s]{3,}$', nombre_candidato) and nombre_candidato.lower() not in ["nuevo", "usado", "sí", "no", "gracias", "q5", "a3", "onix", "eclipse"]:
-                    nombre_valido = nombre_candidato.title()
+            nombre_candidato = " ".join(texto_words)  # Usar todo el texto como nombre
+            if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ\s]{3,}$', nombre_candidato) and nombre_candidato.lower() not in ["nuevo", "usado", "sí", "no", "gracias", "q5", "a3", "onix", "eclipse"]:
+                nombre_valido = nombre_candidato.title()
             if nombre_valido:
                 sesion["nombre"] = nombre_valido
                 guardar_sesion(cliente_id, sesion)
@@ -541,6 +540,10 @@ async def webhook(req: Mensaje):
                 contexto = f"El cliente {sesion['nombre']} no confirmó el modelo y quiere elegir otro. Muestra los modelos disponibles."
                 prompt = f"{sesion['nombre']}, ¿cuál modelo prefieres? Estos son los disponibles: {', '.join(modelos)}."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
+            elif "gracias" in texto.lower():
+                contexto = f"El cliente {sesion['nombre']} dijo 'gracias' antes de confirmar el modelo {sesion['modelo']}. Pide confirmación."
+                prompt = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
             else:
                 contexto = f"El cliente {sesion['nombre']} no ha confirmado el modelo {sesion['modelo']}. Pide confirmación."
                 prompt = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
