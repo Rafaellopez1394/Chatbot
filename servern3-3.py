@@ -42,7 +42,7 @@ sends_col = db["sends"]
 BOT_NOMBRE = "Alex"
 AGENCIA = "Volkswagen Eurocity Culiacán"
 TIEMPO_RESPUESTA_EJECUTIVO = 300
-MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1", "Nivus", "Taos", "T-Cross", "Virtus", "Jetta"]
+MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1", "Nivus", "Taos", "T-Cross", "Virtus", "Jetta", "Tiguan", "Jetta GLI", "GTI", "Amarok Life", "Amarok Style", "Amarok Aventura", "Cross Sport", "Crafter", "Caddy"]
 
 # ------------------------------
 # Pydantic models
@@ -63,6 +63,24 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Content-Type": "application/x-www-form-urlencoded"
 }
+
+def normalizar_modelo(modelo):
+    """Normaliza nombres de modelos eliminando prefijos y corrigiendo errores."""
+    if not modelo:
+        return None
+    modelo = modelo.lower().strip()
+    # Eliminar prefijos innecesarios
+    for prefix in ["volkswagen", "nuevo", "nueva"]:
+        modelo = modelo.replace(prefix, "").strip()
+    # Corregir errores conocidos
+    correcciones = {
+        "tera": "Teramont",
+        "taigun": "Tiguan"
+    }
+    for error, correcto in correcciones.items():
+        if error in modelo:
+            modelo = modelo.replace(error, correcto.lower())
+    return modelo.title()
 
 def obtener_autos_nuevos(force_refresh=False):
     try:
@@ -309,24 +327,25 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente de manera amigable, natural y concisa para elegir un auto. "
             "Sigue estrictamente este flujo conversacional: "
             "1) Si no tienes el nombre del cliente, responde SOLO: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me dices tu nombre, por favor?' "
-            "   Acepta nombres compuestos (e.g., 'Rafael Lopez') si son razonables. No avances sin un nombre válido (solo letras, mínimo 3 caracteres, sin palabras comunes como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehículo', 'quiero', 'busco', 'sí', 'no', 'gracias'). "
-            "   Si el nombre no es válido, responde SOLO: 'Disculpa, no entendí tu nombre. 😊 ¿Me dices cómo te llamas?' "
+            "   Acepta nombres compuestos (e.g., 'Rafael Robles') si son razonables. No avances sin un nombre válido (solo letras, mínimo 3 caracteres, sin palabras comunes como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehículo', 'quiero', 'busco', 'sí', 'no', 'gracias'). "
+            "   Si el nombre no es válido, responde SOLO: 'Disculpa, no entendí tu nombre. ¿Me dices cómo te llamas?' "
             "2) Si ya tienes el nombre, responde SOLO: '{nombre}, ¿buscas un auto nuevo o usado?' "
             "3) Si ya tienes el tipo de auto, muestra los modelos con: '{nombre}, estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
-            "   Usa SOLO los modelos proporcionados en el contexto. "
+            "   Usa SOLO los modelos proporcionados en el contexto. No uses emojis en esta respuesta ni en las siguientes. "
             "4) Si el cliente selecciona un modelo, pide confirmación con: '{nombre}, ¿confirmas que quieres el modelo {modelo}? Si prefieres otro, dime cuál.' "
             "5) Tras confirmar el modelo (con 'sí', 'si', 'yes', 'confirm'), responde SOLO: '{nombre}, tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto.' "
-            "Responde SOLO en español, de forma directa, amigable y humana. "
-            "Evita CUALQUIER frase técnica, redundante o exagerada como '(esperando el nombre)', 'Recuerda que solo letras', 'proporciona un nombre válido', 'excelente elección', 'absolutamente', 'me alegra ayudarte', 'auto perfecto', o 'necesito conocerte mejor'. "
+            "Responde SOLO en español, de forma directa, amigable y profesional. "
+            "Evita CUALQUIER frase técnica, redundante o exagerada como '(esperando el nombre)', 'Recuerda que solo letras', 'proporciona un nombre válido', 'excelente elección', 'absolutamente', 'sí!', '¡no!', 'me alegra ayudarte', 'auto perfecto', o 'necesito conocerte mejor'. "
+            "No uses emojis en ninguna respuesta después del mensaje inicial. "
             "Si el cliente dice 'no' al confirmar un modelo, responde SOLO: '{nombre}, ¿cuál modelo prefieres? Estos son los disponibles: {modelos}.' "
             "Si el cliente expresa frustración (e.g., 'ya te dije', 'ya dije'), discúlpate y retoma el último paso: "
             "   - Si tienes nombre y tipo de auto, muestra los modelos: '{nombre}, disculpa la confusión. Estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
             "   - Si tienes solo el nombre, pregunta: '{nombre}, disculpa la confusión. ¿Buscas un auto nuevo o usado?' "
-            "   - Si no tienes nada, pide: 'Disculpa la confusión. 😊 ¿Me dices tu nombre, por favor?' "
+            "   - Si no tienes nada, pregunta: 'Disculpa la confusión. ¿Me dices tu nombre, por favor?' "
             "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', responde SOLO: '{nombre}, para comprar tu {modelo} necesitas: 1) Identificación oficial (INE o pasaporte), 2) Comprobante de domicilio (máximo 3 meses), 3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), 4) Solicitud de crédito (si aplica). Un ejecutivo te dará más detalles. ¿Algo más en lo que pueda ayudarte?' "
             "Si el cliente pide 'hablar con un ejecutivo', verifica si tienes su nombre; si no, responde: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me dices tu nombre, por favor?' Luego, responde SOLO: '{nombre}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?' "
-            "Si el cliente dice 'gracias', 'no, gracias' o similares después de confirmar un modelo, responde SOLO: '¡De nada, {nombre}! Un ejecutivo te contactará pronto.' "
-            "Si el cliente envía saludos (e.g., 'hola', 'hi') después de confirmar un modelo, responde SOLO: '¡Hola {nombre}! Tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?'"
+            "Si el cliente dice 'gracias', 'no, gracias' o similares después de confirmar un modelo, responde SOLO: 'De nada, {nombre}. Un ejecutivo te contactará pronto.' "
+            "Si el cliente envía saludos (e.g., 'hola', 'hi') después de confirmar un modelo, responde SOLO: 'Hola {nombre}. Tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?'"
         )
         if es_primer_mensaje:
             system_prompt += "\nUsa SOLO este mensaje inicial: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me dices tu nombre, por favor?'"
@@ -342,15 +361,15 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             respuesta = str(resp['response']).strip()
         else:
             logger.error(f"Respuesta de Ollama no es válida: tipo={type(resp)}, contenido={resp}")
-            return "Disculpa, algo salió mal. 😊 Por favor, intenta de nuevo."
+            return "Disculpa, algo salió mal. Por favor, intenta de nuevo."
         if not respuesta:
             logger.warning("Ollama devolvió una respuesta vacía")
-            return "Disculpa, algo salió mal. 😊 Por favor, intenta de nuevo."
+            return "Disculpa, algo salió mal. Por favor, intenta de nuevo."
         logger.info(f"Respuesta procesada de Ollama: {respuesta}")
         return respuesta
     except Exception as e:
         logger.error(f"Error al comunicarse con Ollama: {str(e)}", exc_info=True)
-        return "Disculpa, algo salió mal. 😊 Por favor, intenta de nuevo."
+        return "Disculpa, algo salió mal. Por favor, intenta de nuevo."
 
 # ------------------------------
 # Webhook operativo
@@ -384,15 +403,15 @@ async def webhook(req: Mensaje):
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             elif texto in ["gracias", "no, gracias", "ok", "de nada"]:
                 contexto = f"El cliente {sesion['nombre']} dijo '{texto}' después de confirmar el modelo {sesion['modelo']}."
-                prompt = f"¡De nada, {sesion['nombre']}! Un ejecutivo te contactará pronto."
+                prompt = f"De nada, {sesion['nombre']}. Un ejecutivo te contactará pronto."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             elif texto in ["hola", "hi", "buenas"]:
                 contexto = f"El cliente {sesion['nombre']} envió un saludo después de confirmar el modelo {sesion['modelo']}."
-                prompt = f"¡Hola {sesion['nombre']}! Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
+                prompt = f"Hola {sesion['nombre']}. Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             else:
                 contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente."
-                prompt = f"¡Hola {sesion['nombre']}! Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
+                prompt = f"Hola {sesion['nombre']}. Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
@@ -426,7 +445,7 @@ async def webhook(req: Mensaje):
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
             else:
                 contexto = "El cliente expresó frustración, pero no ha proporcionado su nombre. Pide el nombre de forma amigable."
-                prompt = f"Disculpa la confusión. 😊 ¿Me dices tu nombre, por favor?"
+                prompt = f"Disculpa la confusión. ¿Me dices tu nombre, por favor?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
@@ -469,7 +488,7 @@ async def webhook(req: Mensaje):
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
             else:
                 contexto = "El cliente no ha proporcionado un nombre válido. Pide el nombre de forma amigable."
-                prompt = f"Disculpa, no entendí tu nombre. 😊 ¿Me dices cómo te llamas?"
+                prompt = f"Disculpa, no entendí tu nombre. ¿Me dices cómo te llamas?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
@@ -527,10 +546,10 @@ async def webhook(req: Mensaje):
                     model_parts = m.lower().split()
                     key_model_name = model_parts[0] if tipo == "usado" else m.lower()
                     key_model_name_normalized = key_model_name.replace(".", "").replace(" ", "")
-                    if texto_lower == key_model_name_normalized or texto_lower in m.lower().replace(".", "").replace(" ", ""):
+                    if texto_lower == key_model_name_normalized:
                         modelo_seleccionado = m
                         break
-                    if levenshtein_distance(key_model_name_normalized, texto_lower) <= 3 and texto not in ["nuevo", "usado", "sí", "si", "yes", "confirm", "no", "gracias", "hola", "hi", "buenas"]:
+                    if levenshtein_distance(key_model_name_normalized, texto_lower) <= 2 and texto not in ["nuevo", "usado", "sí", "si", "yes", "confirm", "no", "gracias", "hola", "hi", "buenas"]:
                         modelo_seleccionado = m
                         break
                 if modelo_seleccionado:
@@ -553,10 +572,10 @@ async def webhook(req: Mensaje):
             model_parts = m.lower().split()
             key_model_name = model_parts[0] if tipo == "usado" else m.lower()
             key_model_name_normalized = key_model_name.replace(".", "").replace(" ", "")
-            if texto_lower == key_model_name_normalized or texto_lower in m.lower().replace(".", "").replace(" ", ""):
+            if texto_lower == key_model_name_normalized:
                 modelo_seleccionado = m
                 break
-            if levenshtein_distance(key_model_name_normalized, texto_lower) <= 3 and texto not in ["nuevo", "usado", "sí", "si", "yes", "confirm", "no", "gracias", "hola", "hi", "buenas"]:
+            if levenshtein_distance(key_model_name_normalized, texto_lower) <= 2 and texto not in ["nuevo", "usado", "sí", "si", "yes", "confirm", "no", "gracias", "hola", "hi", "buenas"]:
                 modelo_seleccionado = m
                 break
         if modelo_seleccionado:
@@ -574,7 +593,7 @@ async def webhook(req: Mensaje):
 
     except Exception as e:
         logger.error(f"Error en el endpoint /webhook: {str(e)}", exc_info=True)
-        respuesta = {"texto": f"Disculpa, {sesion.get('nombre', '') or 'algo'} salió mal. 😊 Por favor, intenta de nuevo.", "botones": []}
+        respuesta = {"texto": f"Disculpa, {sesion.get('nombre', '') or 'algo'} salió mal. Por favor, intenta de nuevo.", "botones": []}
         logger.info(f"Respuesta del webhook (error): {respuesta}")
         return respuesta
 
