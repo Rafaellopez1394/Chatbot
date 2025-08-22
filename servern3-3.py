@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
 from datetime import datetime, timedelta
@@ -8,6 +8,7 @@ import requests
 import logging
 import ollama
 import asyncio
+from ollama import GenerateResponse
 
 # ------------------------------
 # Configuración básica
@@ -18,7 +19,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI()
 try:
     client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
-    client.server_info()  # Verifica la conexión a MongoDB
+    client.server_info()
     logger.info("Conexión a MongoDB establecida")
 except Exception as e:
     logger.error(f"Error al conectar con MongoDB: {e}")
@@ -28,12 +29,13 @@ db = client["chatbot_db"]
 cache_col = db["cache"]
 sesiones_col = db["sesiones"]
 bitacora_col = db["bitacora"]
+asesores_col = db["asesores"]
 
 BOT_NOMBRE = "Alex"
 AGENCIA = "Volkswagen Eurocity Culiacan"
 EJECUTIVOS = ["ejecutivo1", "ejecutivo2", "ejecutivo3"]
-TIEMPO_RESPUESTA_EJECUTIVO = 300  # segundos
-MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1"]  # Respaldo en caso de fallo de API
+TIEMPO_RESPUESTA_EJECUTIVO = 300
+MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1"]
 
 # ------------------------------
 # Pydantic model
@@ -108,10 +110,11 @@ def guardar_sesion(cliente_id, sesion):
     try:
         sesion["cliente_id"] = cliente_id
         sesion["ts"] = datetime.utcnow()
-        sesiones_col.update_one({"cliente_id": cliente_id}, {"$set": sesion}, upsert=True)
-        logger.info(f"Sesión guardada para {cliente_id}: {sesion}")
+        result = sesiones_col.update_one({"cliente_id": cliente_id}, {"$set": sesion}, upsert=True)
+        logger.info(f"Sesión guardada para {cliente_id}: {sesion}, Resultado: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
     except Exception as e:
-        logger.error(f"Error al guardar sesión para {cliente_id}: {e}")
+        logger.error(f"Error al guardar sesión para {cliente_id}: {str(e)}")
+        raise  # Levanta la excepción para depuración
 
 def guardar_bitacora(registro):
     try:
@@ -142,8 +145,22 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None):
         full_prompt = f"{system_prompt}\n\nInstrucción al cliente: {prompt}"
         logger.info(f"Enviando prompt a Ollama: {full_prompt}")
         resp = ollama.generate(model="llama3", prompt=full_prompt)
-        logger.info(f"Respuesta de Ollama: {resp['response']}")
-        return resp["response"].strip()
+        logger.info(f"Respuesta cruda de Ollama: {resp}")
+        
+        if isinstance(resp, GenerateResponse):
+            respuesta = str(resp.response).strip()
+        elif isinstance(resp, dict) and 'response' in resp:
+            respuesta = str(resp['response']).strip()
+        else:
+            logger.error(f"Respuesta de Ollama no es válida: tipo={type(resp)}, contenido={resp}")
+            return "Disculpa, no pude generar una respuesta. Por favor, intenta de nuevo."
+        
+        if not respuesta:
+            logger.warning("Ollama devolvió una respuesta vacía")
+            return "Disculpa, no pude generar una respuesta. Por favor, intenta de nuevo."
+        
+        logger.info(f"Respuesta procesada de Ollama: {respuesta}")
+        return respuesta
     except Exception as e:
         logger.error(f"Error al comunicarse con Ollama: {str(e)}")
         return "Disculpa, tuve un problema procesando tu mensaje. Por favor, intenta de nuevo."
@@ -160,8 +177,8 @@ async def enviar_a_ejecutivo(cliente_id, info_cliente):
                 "info_cliente": info_cliente,
                 "estatus": "pendiente"
             })
-            await asyncio.sleep(1)  # simulación disponibilidad
-            disponible = True  # reemplazar por lógica real
+            await asyncio.sleep(1)
+            disponible = True
             if disponible:
                 guardar_bitacora({
                     "cliente_id": cliente_id,
@@ -182,94 +199,136 @@ async def enviar_a_ejecutivo(cliente_id, info_cliente):
 @app.post("/webhook")
 async def webhook(req: Mensaje):
     cliente_id = req.cliente_id
-    texto = req.texto.lower().strip()
+    texto = req.texto.lower().strip() if req.texto and isinstance(req.texto, str) else ""
     sesion = obtener_sesion(cliente_id)
 
-    # Manejar entrada vacía o genérica
-    if not texto or texto in ["hola", "hi", "buenas"]:
-        contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
-        prompt = f"Hola, bienvenido(a) a {AGENCIA}! 👋 ¿Cómo te llamas?"
-        return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+    try:
+        if not texto or texto in ["hola", "hi", "buenas"]:
+            contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
+            prompt = f"Hola, bienvenido(a) a {AGENCIA}! 👋 ¿Cómo te llamas?"
+            respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+            logger.info(f"Respuesta del webhook: {respuesta}")
+            return respuesta
 
-    # 1️⃣ Solicitar nombre
-    if "nombre" not in sesion:
-        palabras = [p for p in texto.split() if p.isalpha() and p not in ["nuevo", "usado", "auto", "coche", "vehiculo", "quiero", "busco", "asi", "es", "mi", "nombre"]]
-        if palabras:
-            sesion["nombre"] = palabras[0].title()
-            guardar_sesion(cliente_id, sesion)
-            contexto = f"El cliente ha proporcionado su nombre: {sesion['nombre']}. Pregunta si quiere un auto nuevo o usado."
-            prompt = f"¡Hola {sesion['nombre']}!, ¿buscas un auto nuevo o usado?"
-            return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
-        else:
-            contexto = "El cliente no ha proporcionado un nombre válido. Insiste en preguntar su nombre."
-            prompt = f"Hola, necesito tu nombre para ayudarte mejor. 😊 ¿Cómo te llamas?"
-            return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+        if "nombre" not in sesion:
+            palabras = [p for p in texto.split() if p.isalpha() and p not in ["nuevo", "usado", "auto", "coche", "vehiculo", "quiero", "busco", "asi", "es", "mi", "nombre"]]
+            if palabras:
+                sesion["nombre"] = palabras[0].title()
+                guardar_sesion(cliente_id, sesion)
+                contexto = f"El cliente ha proporcionado su nombre: {sesion['nombre']}. Pregunta si quiere un auto nuevo o usado."
+                prompt = f"¡Hola {sesion['nombre']}!, ¿buscas un auto nuevo o usado?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+            else:
+                contexto = "El cliente no ha proporcionado un nombre válido. Insiste en preguntar su nombre."
+                prompt = f"Hola, necesito tu nombre para ayudarte mejor. 😊 ¿Cómo te llamas?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
 
-    # 2️⃣ Preguntar tipo de auto
-    if "tipo_auto" not in sesion:
-        if "nuevo" in texto:
-            sesion["tipo_auto"] = "nuevo"
-            guardar_sesion(cliente_id, sesion)
-        elif "usado" in texto:
-            sesion["tipo_auto"] = "usado"
-            guardar_sesion(cliente_id, sesion)
-        else:
-            contexto = f"El cliente {sesion['nombre']} no ha especificado si quiere un auto nuevo o usado. Pregunta de manera clara."
-            prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
-            return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
+        if "tipo_auto" not in sesion:
+            if "nuevo" in texto:
+                sesion["tipo_auto"] = "nuevo"
+                guardar_sesion(cliente_id, sesion)
+            elif "usado" in texto:
+                sesion["tipo_auto"] = "usado"
+                guardar_sesion(cliente_id, sesion)
+            else:
+                contexto = f"El cliente {sesion['nombre']} no ha especificado si quiere un auto nuevo o usado. Pregunta de manera clara."
+                prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
 
-    # 3️⃣ Mostrar modelos
-    tipo = sesion["tipo_auto"]
-    modelos = obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados()
-    if not modelos:
-        contexto = f"No se pudieron obtener modelos de autos {tipo}. Informa al cliente y sugiere reintentar o contactar a un ejecutivo."
-        prompt = f"{sesion['nombre']}, parece que no tenemos la lista de modelos disponible ahora. ¿Quieres que lo intentemos de nuevo o prefieres hablar con un ejecutivo?"
-        return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Reintentar", "Hablar con ejecutivo"]}
-    sesion["modelos"] = modelos
-    guardar_sesion(cliente_id, sesion)
+        tipo = sesion["tipo_auto"]
+        modelos = obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados()
+        if not modelos:
+            contexto = f"No se pudieron obtener modelos de autos {tipo}. Informa al cliente y sugiere reintentar o contactar a un ejecutivo."
+            prompt = f"{sesion['nombre']}, parece que no tenemos la lista de modelos disponible ahora. ¿Quieres que lo intentemos de nuevo o prefieres hablar con un ejecutivo?"
+            respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Reintentar", "Hablar con ejecutivo"]}
+            logger.info(f"Respuesta del webhook: {respuesta}")
+            return respuesta
 
-    # 4️⃣ Detectar modelo mencionado
-    modelo_seleccionado = next((m for m in modelos if m.lower() in texto), None)
-
-    # 5️⃣ Confirmación modelo
-    if "modelo_confirmado" not in sesion:
-        if modelo_seleccionado:
-            sesion["modelo"] = modelo_seleccionado
-            guardar_sesion(cliente_id, sesion)
-            contexto = f"El cliente {sesion['nombre']} ha seleccionado el modelo {modelo_seleccionado}. Pide confirmación."
-            prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {modelo_seleccionado}? Puedes cambiarlo si quieres."
-            return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
-        else:
-            contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
-            prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
-            return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
-
-    # 6️⃣ Confirmación final
-    if texto in ["sí", "si"]:
-        info_cliente = {
-            "nombre": sesion["nombre"],
-            "tipo_auto": tipo,
-            "modelo": sesion["modelo"],
-            "whatsapp": cliente_id
-        }
-        ejecutivo = await enviar_a_ejecutivo(cliente_id, info_cliente)
-        sesion["modelo_confirmado"] = True
+        sesion["modelos"] = modelos
         guardar_sesion(cliente_id, sesion)
-        contexto = f"El cliente {sesion['nombre']} ha confirmado el modelo {sesion['modelo']}. Informa que un ejecutivo lo contactará."
-        prompt = f"{sesion['nombre']}, un ejecutivo ({ejecutivo if ejecutivo else 'pronto asignado'}) te contactará en breve para ayudarte con tu {sesion['modelo']}."
-        return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
-    elif texto in ["cambiar modelo"]:
-        sesion.pop("modelo", None)
-        sesion.pop("modelo_confirmado", None)
-        guardar_sesion(cliente_id, sesion)
-        contexto = f"El cliente {sesion['nombre']} quiere cambiar de modelo. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
-        prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
-        return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
 
-    # 7️⃣ Manejar entradas no reconocidas
-    contexto = f"El cliente {sesion['nombre']} ha enviado un mensaje no reconocido: {texto}. Guía la conversación para elegir un modelo: {', '.join(modelos[:5])}."
-    prompt = f"{sesion['nombre']}, no entendí bien tu mensaje. Estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
-    return {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+        # Priorizar confirmación si ya hay un modelo seleccionado
+        if "modelo" in sesion and "modelo_confirmado" not in sesion:
+            logger.info(f"Verificando confirmación: texto={texto}, sesion={sesion}")
+            if texto in ["sí", "si"] or "yes" in texto.lower() or "confirm" in texto.lower() or texto == "Sí":
+                info_cliente = {
+                    "nombre": sesion["nombre"],
+                    "tipo_auto": tipo,
+                    "modelo": sesion["modelo"],
+                    "whatsapp": cliente_id
+                }
+                ejecutivo = await enviar_a_ejecutivo(cliente_id, info_cliente)
+                sesion["modelo_confirmado"] = True
+                guardar_sesion(cliente_id, sesion)
+                contexto = f"El cliente {sesion['nombre']} ha confirmado el modelo {sesion['modelo']}. Informa que un ejecutivo lo contactará."
+                prompt = f"{sesion['nombre']}, un ejecutivo ({ejecutivo if ejecutivo else 'pronto asignado'}) te contactará en breve para ayudarte con tu {sesion['modelo']}."
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+            elif texto in ["cambiar modelo", "cambiar"]:
+                sesion.pop("modelo", None)
+                sesion.pop("modelo_confirmado", None)
+                guardar_sesion(cliente_id, sesion)
+                contexto = f"El cliente {sesion['nombre']} quiere cambiar de modelo. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
+                prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+
+        # Selección de modelo
+        modelo_seleccionado = None
+        texto_lower = texto.lower()
+        for m in modelos:
+            model_parts = m.lower().split()
+            key_model_name = model_parts[-1] if model_parts[0] == "nuevo" else m.lower()
+            if key_model_name in texto_lower or m.lower() in texto_lower:
+                modelo_seleccionado = m
+                break
+        logger.info(f"Modelos disponibles: {modelos}, Texto: {texto}, Modelo seleccionado: {modelo_seleccionado}")
+
+        if "modelo_confirmado" not in sesion:
+            if modelo_seleccionado:
+                sesion["modelo"] = modelo_seleccionado
+                guardar_sesion(cliente_id, sesion)
+                contexto = f"El cliente {sesion['nombre']} ha seleccionado el modelo {modelo_seleccionado}. Pide confirmación."
+                prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {modelo_seleccionado}? Puedes cambiarlo si quieres."
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+            else:
+                contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
+                prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+
+        # Respaldo para mensajes no reconocidos
+        contexto = f"El cliente {sesion['nombre']} ha enviado un mensaje no reconocido: {texto}. Guía la conversación para elegir un modelo: {', '.join(modelos[:5])}."
+        prompt = f"{sesion['nombre']}, no entendí bien tu mensaje. Estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
+        respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+        logger.info(f"Respuesta del webhook: {respuesta}")
+        return respuesta
+
+    except Exception as e:
+        logger.error(f"Error en el endpoint /webhook: {str(e)}")
+        respuesta = {"texto": "Lo siento, ocurrió un error en el servidor. Por favor, intenta de nuevo.", "botones": []}
+        logger.info(f"Respuesta del webhook (error): {respuesta}")
+        return respuesta
+
+@app.get("/get_asesores")
+def get_asesores():
+    try:
+        asesores = list(asesores_col.find({"activo": True}, {"telefono": 1, "_id": 0}))
+        return [a["telefono"] for a in asesores if "telefono" in a]
+    except Exception as e:
+        logger.error(f"Error en /get_asesores: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error del servidor: {str(e)}")
 
 # ------------------------------
 # Scheduler refresco cache
