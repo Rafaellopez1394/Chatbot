@@ -41,7 +41,7 @@ BOT_NOMBRE = "Alex"
 AGENCIA = "Volkswagen Eurocity Culiacan"
 EJECUTIVOS = ["ejecutivo1", "ejecutivo2", "ejecutivo3"]
 TIEMPO_RESPUESTA_EJECUTIVO = 300
-MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1"]
+MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1", "Nivus", "Taos", "T-Cross", "Virtus", "Jetta"]
 
 # ------------------------------
 # Pydantic model
@@ -93,7 +93,7 @@ def obtener_autos_nuevos(force_refresh=False):
     
     except Exception as e:
         logger.error(f"Error al obtener autos nuevos: {e}", exc_info=True)
-        return []
+        return MODELOS_RESPALDO
 
 def obtener_autos_usados(force_refresh=False):
     try:
@@ -147,14 +147,14 @@ def obtener_autos_usados(force_refresh=False):
         return modelos
     except Exception as e:
         logger.error(f"Error al obtener autos usados: {e}", exc_info=True)
-        return []
+        return MODELOS_RESPALDO
 
 # ------------------------------
 # Sesiones y bitácora
 # ------------------------------
 def obtener_sesion(cliente_id):
-    obtener_autos_nuevos(force_refresh=True)
-    obtener_autos_usados(force_refresh=True)
+    #obtener_autos_nuevos(force_refresh=True)
+    #obtener_autos_usados(force_refresh=True)
     try:
         sesion = sesiones_col.find_one({"cliente_id": cliente_id}) or {}
         logger.info(f"Sesión recuperada para {cliente_id}: {sesion}")
@@ -198,7 +198,8 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             "5) Asigna un ejecutivo. "
             "No uses saludos redundantes como 'Hola' o 'Me alegra' en cada mensaje, especialmente después del primer mensaje. "
             "Responde únicamente en español, de manera directa, profesional y concisa, enfocándote en la solicitud del cliente. "
-            "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', proporciona una lista clara de documentos necesarios para la compra de un auto."
+            "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', proporciona una lista clara de documentos necesarios para la compra de un auto. "
+            "Si el cliente elige 'hablar con un ejecutivo', asigna un ejecutivo inmediatamente y notifica al cliente."
         )
         if es_primer_mensaje:
             system_prompt += "\nEn el primer mensaje, usa un tono de bienvenida amigable, pero sin repetir saludos en mensajes posteriores."
@@ -289,6 +290,21 @@ async def webhook(req: Mensaje):
                 contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
                 prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+            #logger.info(f"Respuesta del webhook: {respuesta}")
+            return respuesta
+
+        # Manejar solicitud de hablar con un ejecutivo
+        if "hablar con un ejecutivo" in texto or "ejecutivo" in texto:
+            info_cliente = {
+                "nombre": sesion.get("nombre", "Cliente"),
+                "tipo_auto": sesion.get("tipo_auto", "no especificado"),
+                "modelo": sesion.get("modelo", "no especificado"),
+                "whatsapp": cliente_id
+            }
+            ejecutivo = await enviar_a_ejecutivo(cliente_id, info_cliente)
+            contexto = f"El cliente {sesion.get('nombre', 'Cliente')} ha solicitado hablar con un ejecutivo."
+            prompt = f"{sesion.get('nombre', 'Cliente')}, un ejecutivo ({ejecutivo if ejecutivo else 'pronto asignado'}) te contactará en breve para ayudarte. ¿Hay algo más en lo que pueda ayudarte?"
+            respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             #logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
 
