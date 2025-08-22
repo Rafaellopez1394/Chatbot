@@ -191,9 +191,9 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
         system_prompt = (
             f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente paso a paso para elegir un auto. "
             "Sigue estrictamente este flujo conversacional: "
-            "1) Solicita el nombre si no está registrado. No avances hasta que el cliente proporcione un nombre válido (una palabra con solo letras, al menos 3 caracteres, que no sea una palabra común como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehiculo', 'quiero', 'busco', 'asi', 'es', 'mi', 'nombre', 'buenas', 'hi'). "
+            "1) Solicita el nombre si no está registrado. Acepta nombres compuestos (e.g., 'Rafael Lopez') tomando la primera palabra válida o el nombre completo si es razonable. No avances hasta que el cliente proporcione un nombre válido (solo letras, al menos 3 caracteres, no palabras comunes como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehiculo', 'quiero', 'busco', 'asi', 'es', 'mi', 'nombre', 'buenas', 'hi'). "
             "2) Pregunta si quiere un auto nuevo o usado. Usa siempre 'usado', no 'used'. No listes modelos en este paso. "
-            "3) Muestra modelos disponibles según el tipo de auto, usando SOLO los modelos proporcionados en el contexto. "
+            "3) Muestra todos los modelos disponibles según el tipo de auto, usando SOLO los modelos proporcionados en el contexto. "
             "4) Confirma el modelo seleccionado. "
             "5) Asigna un ejecutivo. "
             "No uses saludos redundantes como 'Hola' o 'Me alegra' en cada mensaje, especialmente después del primer mensaje. "
@@ -304,9 +304,9 @@ async def webhook(req: Mensaje):
             elif "nombre" in sesion and "tipo_auto" in sesion:
                 logger.info(f"Sesión existente con tipo_auto para {cliente_id}: {sesion}")
                 modelos = sesion.get("modelos", obtener_autos_nuevos() if sesion["tipo_auto"] == "nuevo" else obtener_autos_usados())
-                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra modelos: {', '.join(modelos[:5])}."
-                prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra todos los modelos: {', '.join(modelos)}."
+                prompt = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
                 #logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             elif "nombre" in sesion:
@@ -325,16 +325,23 @@ async def webhook(req: Mensaje):
 
         if "nombre" not in sesion:
             nombre_valido = None
-            for palabra in texto.split():
-                if (
-                    re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ]{3,}$', palabra) and
-                    palabra.lower() not in [
-                        "que", "rollo", "hola", "nuevo", "usado", "auto", "coche", "vehiculo",
-                        "quiero", "busco", "asi", "es", "mi", "nombre", "buenas", "hi"
-                    ]
-                ):
-                    nombre_valido = palabra.title()
-                    break
+            texto_words = texto.split()
+            # Intentar tomar el nombre completo o la primera palabra válida
+            if len(texto_words) > 1:
+                nombre_candidato = " ".join(texto_words[:2])  # Tomar hasta dos palabras para nombres compuestos
+                if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ\s]{3,}$', nombre_candidato):
+                    nombre_valido = nombre_candidato.title()
+            else:
+                for palabra in texto_words:
+                    if (
+                        re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ]{3,}$', palabra) and
+                        palabra.lower() not in [
+                            "que", "rollo", "hola", "nuevo", "usado", "auto", "coche", "vehiculo",
+                            "quiero", "busco", "asi", "es", "mi", "nombre", "buenas", "hi"
+                        ]
+                    ):
+                        nombre_valido = palabra.title()
+                        break
             if nombre_valido:
                 sesion["nombre"] = nombre_valido
                 guardar_sesion(cliente_id, sesion)
@@ -398,9 +405,9 @@ async def webhook(req: Mensaje):
                 sesion.pop("modelo", None)
                 sesion.pop("modelo_confirmado", None)
                 guardar_sesion(cliente_id, sesion)
-                contexto = f"El cliente {sesion['nombre']} quiere cambiar de modelo. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
-                prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+                contexto = f"El cliente {sesion['nombre']} quiere cambiar de modelo. Muestra todos los modelos {tipo}: {', '.join(modelos)}."
+                prompt = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
 
@@ -429,16 +436,16 @@ async def webhook(req: Mensaje):
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             else:
-                contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo válido. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
-                prompt = f"{sesion['nombre']}, no entendí tu selección. Estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+                contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo válido. Muestra todos los modelos {tipo}: {', '.join(modelos)}."
+                prompt = f"{sesion['nombre']}, no entendí tu selección. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
 
         # Respaldo para mensajes no reconocidos
-        contexto = f"El cliente {sesion['nombre']} ha enviado un mensaje no reconocido: {texto}. Guía la conversación para elegir un modelo: {', '.join(modelos[:5])}."
-        prompt = f"{sesion['nombre']}, no entendí bien tu mensaje. Estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
-        respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+        contexto = f"El cliente {sesion['nombre']} ha enviado un mensaje no reconocido: {texto}. Guía la conversación para elegir un modelo: {', '.join(modelos)}."
+        prompt = f"{sesion['nombre']}, no entendí bien tu mensaje. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+        respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
         logger.info(f"Respuesta del webhook: {respuesta}")
         return respuesta
 
