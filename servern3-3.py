@@ -74,13 +74,13 @@ def obtener_autos_nuevos(force_refresh=False):
             return cache.get("data", [])
         url = "https://vw-eurocity.com.mx/info/consultas.ashx"
         payload = {"r": "cargaAutosTodos", "x": "0.123456789"} 
-        logger.info(f"Enviando solicitud a {url} con payload {payload}")
+        #logger.info(f"Enviando solicitud a {url} con payload {payload}")
         res = requests.post(url, data=payload, headers=headers, timeout=10)
         res.raise_for_status()
 
         data = res.json()
 
-        logger.info(f"Respuesta de la API (autos nuevos): {data}")
+        #logger.info(f"Respuesta de la API (autos nuevos): {data}")
         modelos_unicos = set()   # aquí evitamos duplicados
         modelos = []
 
@@ -120,11 +120,11 @@ def obtener_autos_usados(force_refresh=False):
             "Referer": "https://vw-eurocity.com.mx/Seminuevos/"
         }
         payload = {"r": "CheckDist"}
-        logger.info(f"Enviando solicitud a {url} con payload {payload}")
+        #logger.info(f"Enviando solicitud a {url} con payload {payload}")
         res = requests.post(url, headers=headers_usados, data=payload, timeout=10)
         res.raise_for_status()
         data = res.json()
-        logger.info(f"Respuesta de la API (autos usados): {data}")
+        #logger.info(f"Respuesta de la API (autos usados): {data}")
         modelos = list({f"{auto.get('Modelo')} ({auto.get('Anio')})" for auto in data.get("LiAutos", []) if auto.get("Modelo")})
         if not modelos:
             logger.warning("No se obtuvieron modelos usados, usando respaldo")
