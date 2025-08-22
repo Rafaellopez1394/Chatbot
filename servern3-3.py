@@ -52,47 +52,55 @@ def obtener_autos_nuevos(force_refresh=False):
     try:
         ahora = datetime.utcnow()
         cache = cache_col.find_one({"_id": "autos_nuevos"})
+        logger.info(f"Cache encontrado para autos_nuevos: {cache}")
         if cache and not force_refresh and (ahora - cache.get("ts", ahora) < timedelta(hours=3)):
             logger.info("Usando caché para autos nuevos")
             return cache.get("data", [])
         url = "https://vw-eurocity.com.mx/info/consultas.ashx"
         payload = {"r": "cargaAutosTodos", "x": str(random.random())}
+        logger.info(f"Enviando solicitud a {url} con payload {payload}")
         res = requests.post(url, data=payload, timeout=10)
         res.raise_for_status()
         data = res.json()
+        logger.info(f"Respuesta de la API (autos nuevos): {data}")
         modelos = list({auto.get("modelo") for auto in data if auto.get("modelo")})
         if not modelos:
             logger.warning("No se obtuvieron modelos nuevos, usando respaldo")
             modelos = MODELOS_RESPALDO
-        cache_col.update_one({"_id": "autos_nuevos"}, {"$set": {"data": modelos, "ts": ahora}}, upsert=True)
+        result = cache_col.update_one({"_id": "autos_nuevos"}, {"$set": {"data": modelos, "ts": ahora}}, upsert=True)
+        logger.info(f"Resultado de update_one para autos_nuevos: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
         logger.info(f"Autos nuevos obtenidos: {modelos}")
         return modelos
     except Exception as e:
-        logger.error(f"Error al obtener autos nuevos: {e}")
+        logger.error(f"Error al obtener autos nuevos: {e}", exc_info=True)
         return MODELOS_RESPALDO
 
 def obtener_autos_usados(force_refresh=False):
     try:
         ahora = datetime.utcnow()
         cache = cache_col.find_one({"_id": "autos_usados"})
+        logger.info(f"Cache encontrado para autos_usados: {cache}")
         if cache and not force_refresh and (ahora - cache.get("ts", ahora) < timedelta(hours=3)):
             logger.info("Usando caché para autos usados")
             return cache.get("data", [])
         url = "https://vw-eurocity.com.mx/SeminuevosMotorV3/info/consultas.aspx"
         headers = {"User-Agent": "Mozilla/5.0"}
         payload = {"r": "CheckDist"}
+        logger.info(f"Enviando solicitud a {url} con payload {payload}")
         res = requests.post(url, headers=headers, data=payload, timeout=10)
         res.raise_for_status()
         data = res.json()
+        logger.info(f"Respuesta de la API (autos usados): {data}")
         modelos = list({f"{auto.get('Modelo')} ({auto.get('Anio')})" for auto in data.get("LiAutos", []) if auto.get("Modelo")})
         if not modelos:
             logger.warning("No se obtuvieron modelos usados, usando respaldo")
             modelos = MODELOS_RESPALDO
-        cache_col.update_one({"_id": "autos_usados"}, {"$set": {"data": modelos, "ts": ahora}}, upsert=True)
+        result = cache_col.update_one({"_id": "autos_usados"}, {"$set": {"data": modelos, "ts": ahora}}, upsert=True)
+        logger.info(f"Resultado de update_one para autos_usados: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
         logger.info(f"Autos usados obtenidos: {modelos}")
         return modelos
     except Exception as e:
-        logger.error(f"Error al obtener autos usados: {e}")
+        logger.error(f"Error al obtener autos usados: {e}", exc_info=True)
         return MODELOS_RESPALDO
 
 # ------------------------------
