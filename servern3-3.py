@@ -57,6 +57,7 @@ headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
     "Content-Type": "application/x-www-form-urlencoded"
 }
+
 def obtener_autos_nuevos(force_refresh=False):
     try:
         ahora = datetime.utcnow()
@@ -139,9 +140,9 @@ def obtener_autos_usados(force_refresh=False):
                     })
         result = cache_col.update_one(
             {"_id": "autos_usados"},
-              {"$set": {"data": modelos, "ts": ahora}},
-                upsert=True
-                )
+            {"$set": {"data": modelos, "ts": ahora}},
+            upsert=True
+        )
         logger.info(f"Resultado de update_one para autos_usados: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
         logger.info(f"Autos usados obtenidos: {modelos}")
         return modelos
@@ -195,11 +196,11 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             "2) Pregunta si quiere un auto nuevo o usado. Usa siempre 'usado', no 'used'. No listes modelos en este paso. "
             "3) Muestra todos los modelos disponibles según el tipo de auto, usando SOLO los modelos proporcionados en el contexto. "
             "4) Confirma el modelo seleccionado. "
-            "5) Asigna un ejecutivo. "
+            "5) Asigna un ejecutivo, pero NO menciones el nombre del ejecutivo; usa un mensaje genérico como 'Un ejecutivo te contactará pronto'. "
             "No uses saludos redundantes como 'Hola' o 'Me alegra' en cada mensaje, especialmente después del primer mensaje. "
             "Responde únicamente en español, de manera directa, profesional y concisa, enfocándote en la solicitud del cliente. "
             "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', proporciona una lista clara de documentos necesarios para la compra de un auto. "
-            "Si el cliente elige 'hablar con un ejecutivo', asigna un ejecutivo inmediatamente y notifica al cliente."
+            "Si el cliente elige 'hablar con un ejecutivo' solicita su nombre y una vez proporcionado el nombre, asigna un ejecutivo inmediatamente y notifica al cliente con un mensaje genérico."
         )
         if es_primer_mensaje:
             system_prompt += "\nEn el primer mensaje, usa un tono de bienvenida amigable, pero sin repetir saludos en mensajes posteriores."
@@ -249,12 +250,12 @@ async def enviar_a_ejecutivo(cliente_id, info_cliente):
                     "info_cliente": info_cliente,
                     "estatus": "asignado"
                 })
-                return ejecutivo
+                return True  # Indica que se asignó un ejecutivo
         logger.warning(f"No se encontró ejecutivo disponible para {cliente_id}")
-        return None
+        return False
     except Exception as e:
         logger.error(f"Error al asignar ejecutivo para {cliente_id}: {e}", exc_info=True)
-        return None
+        return False
 
 # ------------------------------
 # Webhook operativo
@@ -301,9 +302,9 @@ async def webhook(req: Mensaje):
                 "modelo": sesion.get("modelo", "no especificado"),
                 "whatsapp": cliente_id
             }
-            ejecutivo = await enviar_a_ejecutivo(cliente_id, info_cliente)
+            asignado = await enviar_a_ejecutivo(cliente_id, info_cliente)
             contexto = f"El cliente {sesion.get('nombre', 'Cliente')} ha solicitado hablar con un ejecutivo."
-            prompt = f"{sesion.get('nombre', 'Cliente')}, un ejecutivo ({ejecutivo if ejecutivo else 'pronto asignado'}) te contactará en breve para ayudarte. ¿Hay algo más en lo que pueda ayudarte?"
+            prompt = f"{sesion.get('nombre', 'Cliente')}, un ejecutivo te contactará pronto para ayudarte. ¿Hay algo más en lo que pueda ayudarte?"
             respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             #logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
@@ -409,11 +410,11 @@ async def webhook(req: Mensaje):
                     "modelo": sesion["modelo"],
                     "whatsapp": cliente_id
                 }
-                ejecutivo = await enviar_a_ejecutivo(cliente_id, info_cliente)
+                asignado = await enviar_a_ejecutivo(cliente_id, info_cliente)
                 sesion["modelo_confirmado"] = True
                 guardar_sesion(cliente_id, sesion)
                 contexto = f"El cliente {sesion['nombre']} ha confirmado el modelo {sesion['modelo']}. Informa que un ejecutivo lo contactará."
-                prompt = f"{sesion['nombre']}, un ejecutivo ({ejecutivo if ejecutivo else 'pronto asignado'}) te contactará en breve para ayudarte con tu {sesion['modelo']}."
+                prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto para ayudarte."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
@@ -429,10 +430,10 @@ async def webhook(req: Mensaje):
 
         # Selección de modelo con tolerancia a errores tipográficos
         modelo_seleccionado = None
-        texto_lower = texto.lower().replace(".", "").replace(" ", "")  # Normalizar texto
+        texto_lower = texto.lower().replace(".", "").replace(" ", "")
         for m in modelos:
             model_parts = m.lower().split()
-            key_model_name = model_parts[0] if tipo == "usado" else model_parts[-1] if model_parts[0] == "nuevo" else m.lower()
+            key_model_name = model_parts[0] if tipo == "usado" else m.lower()
             key_model_name_normalized = key_model_name.replace(".", "").replace(" ", "")
             if key_model_name_normalized in texto_lower or m.lower().replace(".", "").replace(" ", "") in texto_lower:
                 modelo_seleccionado = m
@@ -453,14 +454,14 @@ async def webhook(req: Mensaje):
                 return respuesta
             else:
                 contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo válido. Muestra todos los modelos {tipo}: {', '.join(modelos)}."
-                prompt = f"{sesion['nombre']}, no entendí tu selección. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                prompt = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
 
         # Respaldo para mensajes no reconocidos
         contexto = f"El cliente {sesion['nombre']} ha enviado un mensaje no reconocido: {texto}. Guía la conversación para elegir un modelo: {', '.join(modelos)}."
-        prompt = f"{sesion['nombre']}, no entendí bien tu mensaje. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+        prompt = f"{sesion['nombre']}, no entendí tu selección. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
         respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
         logger.info(f"Respuesta del webhook: {respuesta}")
         return respuesta
