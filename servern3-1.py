@@ -386,7 +386,7 @@ def obtener_autos_usados(force_refresh: bool = False) -> list[dict]:
 
         if (not force_refresh) and cache and (ahora - cache.get("ts", ahora) < timedelta(hours=3)):
             return cache.get("data", [])
-
+        
         url = "https://vw-eurocity.com.mx/SeminuevosMotorV3/info/consultas.aspx"
         headers_usados = {
             "X-Requested-With": "XMLHttpRequest",

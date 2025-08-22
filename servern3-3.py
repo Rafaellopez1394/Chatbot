@@ -10,7 +10,7 @@ import ollama
 import asyncio
 from ollama import GenerateResponse
 from Levenshtein import distance as levenshtein_distance
-import re  # Para validación de nombres
+import re
 
 # ------------------------------
 # Configuración básica
@@ -53,6 +53,10 @@ class Mensaje(BaseModel):
 # ------------------------------
 # Funciones para autos
 # ------------------------------
+headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    "Content-Type": "application/x-www-form-urlencoded"
+}
 def obtener_autos_nuevos(force_refresh=False):
     try:
         ahora = datetime.utcnow()
@@ -62,23 +66,34 @@ def obtener_autos_nuevos(force_refresh=False):
             logger.info("Usando caché para autos nuevos")
             return cache.get("data", [])
         url = "https://vw-eurocity.com.mx/info/consultas.ashx"
-        payload = {"r": "cargaAutosTodos", "x": str(random.random())}
+        payload = {"r": "cargaAutosTodos", "x": "0.123456789"} 
         logger.info(f"Enviando solicitud a {url} con payload {payload}")
-        res = requests.post(url, data=payload, timeout=10)
+        res = requests.post(url, data=payload, headers=headers, timeout=10)
         res.raise_for_status()
+
         data = res.json()
+
         logger.info(f"Respuesta de la API (autos nuevos): {data}")
-        modelos = list({auto.get("modelo") for auto in data if auto.get("modelo")})
-        if not modelos:
-            logger.warning("No se obtuvieron modelos nuevos, usando respaldo")
-            modelos = MODELOS_RESPALDO
-        result = cache_col.update_one({"_id": "autos_nuevos"}, {"$set": {"data": modelos, "ts": ahora}}, upsert=True)
-        logger.info(f"Resultado de update_one para autos_nuevos: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
-        logger.info(f"Autos nuevos obtenidos: {modelos}")
+        modelos_unicos = set()   # aquí evitamos duplicados
+        modelos = []
+
+        for auto in data:
+            modelo = auto.get("modelo")
+            if modelo and modelo not in modelos_unicos:
+                modelos_unicos.add(modelo)
+                modelos.append(modelo)
+
+        # Guardamos en cache sin duplicados
+        cache_col.update_one(
+            {"_id": "autos_nuevos"},
+            {"$set": {"data": modelos, "ts": ahora}},
+            upsert=True
+        )
         return modelos
+    
     except Exception as e:
         logger.error(f"Error al obtener autos nuevos: {e}", exc_info=True)
-        return MODELOS_RESPALDO
+        return []
 
 def obtener_autos_usados(force_refresh=False):
     try:
@@ -88,30 +103,58 @@ def obtener_autos_usados(force_refresh=False):
         if cache and not force_refresh and (ahora - cache.get("ts", ahora) < timedelta(hours=3)):
             logger.info("Usando caché para autos usados")
             return cache.get("data", [])
+        
         url = "https://vw-eurocity.com.mx/SeminuevosMotorV3/info/consultas.aspx"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers_usados = {
+            "X-Requested-With": "XMLHttpRequest",
+            "User-Agent": headers["User-Agent"],
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": "https://vw-eurocity.com.mx",
+            "Referer": "https://vw-eurocity.com.mx/Seminuevos/",
+        }
         payload = {"r": "CheckDist"}
         logger.info(f"Enviando solicitud a {url} con payload {payload}")
-        res = requests.post(url, headers=headers, data=payload, timeout=10)
+        res = requests.post(url, headers=headers_usados, data=payload, timeout=10)
         res.raise_for_status()
         data = res.json()
         logger.info(f"Respuesta de la API (autos usados): {data}")
         modelos = list({f"{auto.get('Modelo')} ({auto.get('Anio')})" for auto in data.get("LiAutos", []) if auto.get("Modelo")})
         if not modelos:
             logger.warning("No se obtuvieron modelos usados, usando respaldo")
-            modelos = MODELOS_RESPALDO
-        result = cache_col.update_one({"_id": "autos_usados"}, {"$set": {"data": modelos, "ts": ahora}}, upsert=True)
+            modelos = []
+            vistos = set()
+
+            for auto in data.get("LiAutos", []):
+                modelo = auto.get("Modelo")
+                anio = auto.get("Anio")
+
+                # clave única: modelo+año
+                clave = f"{modelo}-{anio}"
+
+                if modelo and anio and clave not in vistos:
+                    vistos.add(clave)
+                    modelos.append({
+                        "modelo": modelo,
+                        "anio": anio
+                    })
+        result = cache_col.update_one(
+            {"_id": "autos_usados"},
+              {"$set": {"data": modelos, "ts": ahora}},
+                upsert=True
+                )
         logger.info(f"Resultado de update_one para autos_usados: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
         logger.info(f"Autos usados obtenidos: {modelos}")
         return modelos
     except Exception as e:
         logger.error(f"Error al obtener autos usados: {e}", exc_info=True)
-        return MODELOS_RESPALDO
+        return []
 
 # ------------------------------
 # Sesiones y bitácora
 # ------------------------------
 def obtener_sesion(cliente_id):
+    obtener_autos_nuevos(force_refresh=True)
+    obtener_autos_usados(force_refresh=True)
     try:
         sesion = sesiones_col.find_one({"cliente_id": cliente_id}) or {}
         logger.info(f"Sesión recuperada para {cliente_id}: {sesion}")
@@ -149,7 +192,7 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente paso a paso para elegir un auto. "
             "Sigue estrictamente este flujo conversacional: "
             "1) Solicita el nombre si no está registrado. No avances hasta que el cliente proporcione un nombre válido (una palabra con solo letras, al menos 3 caracteres, que no sea una palabra común como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehiculo', 'quiero', 'busco', 'asi', 'es', 'mi', 'nombre', 'buenas', 'hi'). "
-            "2) Pregunta si quiere un auto nuevo o usado. No listes modelos en este paso. "
+            "2) Pregunta si quiere un auto nuevo o usado. Usa siempre 'usado', no 'used'. No listes modelos en este paso. "
             "3) Muestra modelos disponibles según el tipo de auto, usando SOLO los modelos proporcionados en el contexto. "
             "4) Confirma el modelo seleccionado. "
             "5) Asigna un ejecutivo. "
@@ -162,9 +205,9 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
         if contexto_sesion:
             system_prompt += f"\nContexto actual: {contexto_sesion}"
         full_prompt = f"{system_prompt}\n\nInstrucción al cliente: {prompt}"
-        logger.info(f"Enviando prompt a Ollama: {full_prompt}")
+        #logger.info(f"Enviando prompt a Ollama: {full_prompt}")
         resp = ollama.generate(model="llama3", prompt=full_prompt)
-        logger.info(f"Respuesta cruda de Ollama: {resp}")
+        #logger.info(f"Respuesta cruda de Ollama: {resp}")
         
         if isinstance(resp, GenerateResponse):
             respuesta = str(resp.response).strip()
@@ -246,7 +289,7 @@ async def webhook(req: Mensaje):
                 contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
                 prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
-            logger.info(f"Respuesta del webhook: {respuesta}")
+            #logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
 
         # Manejar saludos iniciales, pero respetar la sesión existente
@@ -256,7 +299,7 @@ async def webhook(req: Mensaje):
                 contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó el modelo {sesion['modelo']}. Pide confirmación."
                 prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {sesion['modelo']}? Puedes cambiarlo si quieres."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
-                logger.info(f"Respuesta del webhook: {respuesta}")
+                #logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             elif "nombre" in sesion and "tipo_auto" in sesion:
                 logger.info(f"Sesión existente con tipo_auto para {cliente_id}: {sesion}")
@@ -264,24 +307,23 @@ async def webhook(req: Mensaje):
                 contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra modelos: {', '.join(modelos[:5])}."
                 prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
-                logger.info(f"Respuesta del webhook: {respuesta}")
+                #logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             elif "nombre" in sesion:
                 logger.info(f"Sesión existente con nombre para {cliente_id}: {sesion}")
                 contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero no ha seleccionado tipo_auto. Pregunta si quiere un auto nuevo o usado."
                 prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": ["Nuevo", "Usado"]}
-                logger.info(f"Respuesta del webhook: {respuesta}")
+                #logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             else:
                 contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
                 prompt = f"Bienvenido(a) a {AGENCIA}! 👋 Por favor, dime cómo te llamas."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
-                logger.info(f"Respuesta del webhook: {respuesta}")
+                #logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
 
         if "nombre" not in sesion:
-            # Validar nombre con expresión regular y lista de palabras prohibidas
             nombre_valido = None
             for palabra in texto.split():
                 if (
@@ -364,14 +406,15 @@ async def webhook(req: Mensaje):
 
         # Selección de modelo con tolerancia a errores tipográficos
         modelo_seleccionado = None
-        texto_lower = texto.lower()
+        texto_lower = texto.lower().replace(".", "").replace(" ", "")  # Normalizar texto
         for m in modelos:
             model_parts = m.lower().split()
-            key_model_name = model_parts[-1] if model_parts[0] == "nuevo" else m.lower()
-            if key_model_name in texto_lower or m.lower() in texto_lower:
+            key_model_name = model_parts[0] if tipo == "usado" else model_parts[-1] if model_parts[0] == "nuevo" else m.lower()
+            key_model_name_normalized = key_model_name.replace(".", "").replace(" ", "")
+            if key_model_name_normalized in texto_lower or m.lower().replace(".", "").replace(" ", "") in texto_lower:
                 modelo_seleccionado = m
                 break
-            if levenshtein_distance(key_model_name, texto_lower) <= 2:
+            if levenshtein_distance(key_model_name_normalized, texto_lower) <= 3:
                 modelo_seleccionado = m
                 break
         logger.info(f"Modelos disponibles: {modelos}, Texto: {texto}, Modelo seleccionado: {modelo_seleccionado}")
@@ -386,8 +429,8 @@ async def webhook(req: Mensaje):
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
             else:
-                contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
-                prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
+                contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo válido. Muestra opciones de modelos {tipo}: {', '.join(modelos[:5])}."
+                prompt = f"{sesion['nombre']}, no entendí tu selección. Estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
