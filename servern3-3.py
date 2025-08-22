@@ -9,7 +9,8 @@ import logging
 import ollama
 import asyncio
 from ollama import GenerateResponse
-from Levenshtein import distance as levenshtein_distance  # Requiere `pip install python-Levenshtein`
+from Levenshtein import distance as levenshtein_distance
+import re  # Para validación de nombres
 
 # ------------------------------
 # Configuración básica
@@ -22,9 +23,13 @@ try:
     client = MongoClient("mongodb://localhost:27017/", serverSelectionTimeoutMS=5000)
     client.server_info()
     logger.info("Conexión a MongoDB establecida")
+    db = client["chatbot_db"]
+    test_col = db["test"]
+    test_col.update_one({"_id": "test"}, {"$set": {"data": "test"}}, upsert=True)
+    logger.info("Prueba de escritura en MongoDB exitosa")
 except Exception as e:
-    logger.error(f"Error al conectar con MongoDB: {e}")
-    raise Exception("No se pudo conectar a MongoDB")
+    logger.error(f"Error al conectar con MongoDB o escribir en la base de datos: {e}", exc_info=True)
+    raise Exception("No se pudo conectar a MongoDB o escribir en la base de datos")
 
 db = client["chatbot_db"]
 cache_col = db["cache"]
@@ -114,7 +119,7 @@ def obtener_sesion(cliente_id):
             logger.warning(f"No se encontró sesión para {cliente_id}, devolviendo sesión vacía")
         return sesion
     except Exception as e:
-        logger.error(f"Error al obtener sesión para {cliente_id}: {e}")
+        logger.error(f"Error al obtener sesión para {cliente_id}: {e}", exc_info=True)
         return {}
 
 def guardar_sesion(cliente_id, sesion):
@@ -124,8 +129,8 @@ def guardar_sesion(cliente_id, sesion):
         result = sesiones_col.update_one({"cliente_id": cliente_id}, {"$set": sesion}, upsert=True)
         logger.info(f"Sesión guardada para {cliente_id}: {sesion}, Resultado: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
     except Exception as e:
-        logger.error(f"Error al guardar sesión para {cliente_id}: {str(e)}")
-        raise  # Levanta la excepción para depuración
+        logger.error(f"Error al guardar sesión para {cliente_id}: {str(e)}", exc_info=True)
+        raise
 
 def guardar_bitacora(registro):
     try:
@@ -133,7 +138,7 @@ def guardar_bitacora(registro):
         bitacora_col.insert_one(registro)
         logger.info(f"Bitácora guardada: {registro}")
     except Exception as e:
-        logger.error(f"Error al guardar bitácora: {e}")
+        logger.error(f"Error al guardar bitácora: {e}", exc_info=True)
 
 # ------------------------------
 # Generación de respuesta con Ollama
@@ -143,7 +148,7 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
         system_prompt = (
             f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente paso a paso para elegir un auto. "
             "Sigue estrictamente este flujo conversacional: "
-            "1) Solicita el nombre si no está registrado. No avances hasta que el cliente proporcione un nombre válido (una palabra alfabética que no sea 'nuevo', 'usado', 'auto', 'coche', 'vehiculo', 'quiero', 'busco', 'asi', 'es', 'mi', 'nombre'). "
+            "1) Solicita el nombre si no está registrado. No avances hasta que el cliente proporcione un nombre válido (una palabra con solo letras, al menos 3 caracteres, que no sea una palabra común como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehiculo', 'quiero', 'busco', 'asi', 'es', 'mi', 'nombre', 'buenas', 'hi'). "
             "2) Pregunta si quiere un auto nuevo o usado. No listes modelos en este paso. "
             "3) Muestra modelos disponibles según el tipo de auto, usando SOLO los modelos proporcionados en el contexto. "
             "4) Confirma el modelo seleccionado. "
@@ -176,7 +181,7 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
         logger.info(f"Respuesta procesada de Ollama: {respuesta}")
         return respuesta
     except Exception as e:
-        logger.error(f"Error al comunicarse con Ollama: {str(e)}")
+        logger.error(f"Error al comunicarse con Ollama: {str(e)}", exc_info=True)
         return "Disculpa, tuve un problema procesando tu mensaje. Por favor, intenta de nuevo."
 
 # ------------------------------
@@ -204,7 +209,7 @@ async def enviar_a_ejecutivo(cliente_id, info_cliente):
         logger.warning(f"No se encontró ejecutivo disponible para {cliente_id}")
         return None
     except Exception as e:
-        logger.error(f"Error al asignar ejecutivo para {cliente_id}: {e}")
+        logger.error(f"Error al asignar ejecutivo para {cliente_id}: {e}", exc_info=True)
         return None
 
 # ------------------------------
@@ -276,9 +281,20 @@ async def webhook(req: Mensaje):
                 return respuesta
 
         if "nombre" not in sesion:
-            palabras = [p for p in texto.split() if p.isalpha() and p not in ["nuevo", "usado", "auto", "coche", "vehiculo", "quiero", "busco", "asi", "es", "mi", "nombre"]]
-            if palabras:
-                sesion["nombre"] = palabras[0].title()
+            # Validar nombre con expresión regular y lista de palabras prohibidas
+            nombre_valido = None
+            for palabra in texto.split():
+                if (
+                    re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ]{3,}$', palabra) and
+                    palabra.lower() not in [
+                        "que", "rollo", "hola", "nuevo", "usado", "auto", "coche", "vehiculo",
+                        "quiero", "busco", "asi", "es", "mi", "nombre", "buenas", "hi"
+                    ]
+                ):
+                    nombre_valido = palabra.title()
+                    break
+            if nombre_valido:
+                sesion["nombre"] = nombre_valido
                 guardar_sesion(cliente_id, sesion)
                 contexto = f"El cliente ha proporcionado su nombre: {sesion['nombre']}. Pregunta si quiere un auto nuevo o usado."
                 prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
@@ -287,7 +303,7 @@ async def webhook(req: Mensaje):
                 return respuesta
             else:
                 contexto = "El cliente no ha proporcionado un nombre válido. Insiste en preguntar su nombre."
-                prompt = f"Necesito tu nombre para ayudarte mejor. 😊 ¿Cómo te llamas?"
+                prompt = f"Necesito tu nombre para ayudarte mejor. 😊 Por favor, dime cómo te llamas (por ejemplo, Juan, María)."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
                 logger.info(f"Respuesta del webhook: {respuesta}")
                 return respuesta
@@ -352,11 +368,9 @@ async def webhook(req: Mensaje):
         for m in modelos:
             model_parts = m.lower().split()
             key_model_name = model_parts[-1] if model_parts[0] == "nuevo" else m.lower()
-            # Coincidencia exacta o parcial
             if key_model_name in texto_lower or m.lower() in texto_lower:
                 modelo_seleccionado = m
                 break
-            # Tolerancia a errores tipográficos (distancia de Levenshtein <= 2)
             if levenshtein_distance(key_model_name, texto_lower) <= 2:
                 modelo_seleccionado = m
                 break
@@ -386,7 +400,7 @@ async def webhook(req: Mensaje):
         return respuesta
 
     except Exception as e:
-        logger.error(f"Error en el endpoint /webhook: {str(e)}")
+        logger.error(f"Error en el endpoint /webhook: {str(e)}", exc_info=True)
         respuesta = {"texto": "Lo siento, ocurrió un error en el servidor. Por favor, intenta de nuevo.", "botones": []}
         logger.info(f"Respuesta del webhook (error): {respuesta}")
         return respuesta
@@ -397,7 +411,7 @@ def get_asesores():
         asesores = list(asesores_col.find({"activo": True}, {"telefono": 1, "_id": 0}))
         return [a["telefono"] for a in asesores if "telefono" in a]
     except Exception as e:
-        logger.error(f"Error en /get_asesores: {str(e)}")
+        logger.error(f"Error en /get_asesores: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error del servidor: {str(e)}")
 
 # ------------------------------
@@ -409,4 +423,7 @@ scheduler.start()
 
 if __name__ == "__main__":
     import uvicorn
+    # Forzar actualización del caché al iniciar
+    obtener_autos_nuevos(force_refresh=True)
+    obtener_autos_usados(force_refresh=True)
     uvicorn.run(app, host="0.0.0.0", port=5000)
