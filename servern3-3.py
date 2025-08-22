@@ -40,7 +40,7 @@ assignments_col = db["assignments"]
 sends_col = db["sends"]
 
 BOT_NOMBRE = "Alex"
-AGENCIA = "Volkswagen Eurocity Culiacan"
+AGENCIA = "Volkswagen Eurocity Culiacán"
 TIEMPO_RESPUESTA_EJECUTIVO = 300
 MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1", "Nivus", "Taos", "T-Cross", "Virtus", "Jetta"]
 
@@ -117,7 +117,7 @@ def obtener_autos_usados(force_refresh=False):
             "User-Agent": headers["User-Agent"],
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Origin": "https://vw-eurocity.com.mx",
-            "Referer": "https://vw-eurocity.com.mx/Seminuevos/",
+            "Referer": "https://vw-eurocity.com.mx/Seminuevos/"
         }
         payload = {"r": "CheckDist"}
         logger.info(f"Enviando solicitud a {url} con payload {payload}")
@@ -306,44 +306,50 @@ async def advisor_response(req: AdvisorResponse):
 def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=False):
     try:
         system_prompt = (
-            f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente paso a paso para elegir un auto. "
+            f"Eres {BOT_NOMBRE}, un asistente de {AGENCIA}. Tu objetivo es guiar al cliente de manera amigable y natural para elegir un auto. "
             "Sigue estrictamente este flujo conversacional: "
-            "1) Solicita el nombre si no está registrado. Acepta nombres compuestos (e.g., 'Rafael Lopez') tomando el nombre completo si es razonable. No avances hasta que el cliente proporcione un nombre válido (solo letras, al menos 3 caracteres, no palabras comunes como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehiculo', 'quiero', 'busco', 'asi', 'es', 'mi', 'nombre', 'buenas', 'hi'). "
-            "2) Pregunta si quiere un auto nuevo o usado. Usa siempre 'usado', no 'used'. No listes modelos en este paso. "
-            "3) Muestra todos los modelos disponibles según el tipo de auto, usando SOLO los modelos proporcionados en el contexto. "
-            "4) Confirma el modelo seleccionado con un mensaje claro y conciso. "
-            "5) Tras la confirmación del modelo (respuesta 'sí', 'si', 'yes', o 'confirm'), asigna un ejecutivo inmediatamente con el mensaje: '{nombre}, tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto para ayudarte.' No hagas preguntas adicionales después de la confirmación a menos que el cliente lo solicite explícitamente (e.g., 'documentos'). "
-            "Responde únicamente en español, de manera directa, profesional y concisa. "
-            "Evita saludos redundantes como 'Hola', 'Me alegra', o 'Es importante para nosotros conocerte mejor' en todos los mensajes, incluyendo el primero. "
-            "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', proporciona una lista clara de documentos necesarios para la compra de un auto. "
-            "Si el cliente elige 'hablar con un ejecutivo', solicita su nombre si no está registrado; una vez proporcionado, asigna un ejecutivo inmediatamente y notifica al cliente con un mensaje genérico."
+            "1) Si no tienes el nombre del cliente, pide: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me dices tu nombre, por favor?' "
+            "   Acepta nombres compuestos (e.g., 'Rafael Lopez') si son razonables. No avances sin un nombre válido (solo letras, mínimo 3 caracteres, sin palabras comunes como 'que', 'rollo', 'hola', 'nuevo', 'usado', 'auto', 'coche', 'vehículo', 'quiero', 'busco', 'sí', 'no'). "
+            "   Si el nombre no es válido, responde: 'Disculpa, no entendí tu nombre. 😊 ¿Podrías decirme cómo te llamas?' "
+            "2) Si ya tienes el nombre, pregunta: '{nombre}, ¿buscas un auto nuevo o usado?' No listes modelos en este paso. "
+            "3) Muestra los modelos disponibles según el tipo de auto (nuevo o usado) con: '{nombre}, estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
+            "   Usa SOLO los modelos proporcionados en el contexto. "
+            "4) Confirma el modelo con: '{nombre}, ¿confirmas que quieres el modelo {modelo}? Si prefieres otro, dime cuál.' "
+            "5) Tras confirmar el modelo (con 'sí', 'si', 'yes', o 'confirm'), responde: '{nombre}, tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto.' "
+            "   No hagas preguntas adicionales a menos que el cliente pida información específica (e.g., 'documentos'). "
+            "Responde SOLO en español, de forma directa, amigable y humana. "
+            "Evita frases técnicas o robóticas como '(esperando el nombre del cliente)', 'Recuerda que solo letras', 'proporciona un nombre válido', 'me alegra ayudarte', 'auto perfecto', o 'necesito conocerte mejor'. "
+            "Si el cliente dice 'no' al confirmar un modelo, responde: '{nombre}, ¿cuál modelo prefieres? Estos son los disponibles: {modelos}.' "
+            "Si el cliente expresa frustración (e.g., 'ya te dije', 'ya dije'), discúlpate y retoma el último paso conocido: "
+            "   - Si ya tienes nombre y tipo de auto, muestra los modelos. "
+            "   - Si solo tienes el nombre, pregunta por el tipo de auto. "
+            "   - Si no tienes nada, pide el nombre. "
+            "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', responde: '{nombre}, para comprar tu {modelo} necesitas: 1) Identificación oficial (INE o pasaporte), 2) Comprobante de domicilio (máximo 3 meses), 3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), 4) Solicitud de crédito (si aplica). Un ejecutivo te dará más detalles. ¿Algo más en lo que pueda ayudarte?' "
+            "Si el cliente pide 'hablar con un ejecutivo', verifica si tienes su nombre; si no, pídselo. Luego, responde: '{nombre}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?'"
         )
         if es_primer_mensaje:
-            system_prompt += "\nEn el primer mensaje, usa un tono de bienvenida simple y conciso, e.g., 'Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 Por favor, dime cómo te llamas.'"
+            system_prompt += "\nUsa SOLO este mensaje inicial: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me dices tu nombre, por favor?'"
         if contexto_sesion:
             system_prompt += f"\nContexto actual: {contexto_sesion}"
-        full_prompt = f"{system_prompt}\n\nInstrucción al cliente: {prompt}"
-        #logger.info(f"Enviando prompt a Ollama: {full_prompt}")
+        full_prompt = f"{system_prompt}\n\nMensaje del cliente: {prompt}"
+        logger.info(f"Enviando prompt a Ollama: {full_prompt}")
         resp = ollama.generate(model="llama3", prompt=full_prompt)
-        #logger.info(f"Respuesta cruda de Ollama: {resp}")
-        
+        logger.info(f"Respuesta cruda de Ollama: {resp}")
         if isinstance(resp, GenerateResponse):
             respuesta = str(resp.response).strip()
         elif isinstance(resp, dict) and 'response' in resp:
             respuesta = str(resp['response']).strip()
         else:
             logger.error(f"Respuesta de Ollama no es válida: tipo={type(resp)}, contenido={resp}")
-            return "Disculpa, no pude generar una respuesta. Por favor, intenta de nuevo."
-        
+            return "Disculpa, algo salió mal. 😊 Por favor, intenta de nuevo."
         if not respuesta:
             logger.warning("Ollama devolvió una respuesta vacía")
-            return "Disculpa, no pude generar una respuesta. Por favor, intenta de nuevo."
-        
+            return "Disculpa, algo salió mal. 😊 Por favor, intenta de nuevo."
         logger.info(f"Respuesta procesada de Ollama: {respuesta}")
         return respuesta
     except Exception as e:
         logger.error(f"Error al comunicarse con Ollama: {str(e)}", exc_info=True)
-        return "Disculpa, tuve un problema procesando tu mensaje. Por favor, intenta de nuevo."
+        return "Disculpa, algo salió mal. 😊 Por favor, intenta de nuevo."
 
 # ------------------------------
 # Webhook operativo
@@ -355,67 +361,85 @@ async def webhook(req: Mensaje):
     sesion = obtener_sesion(cliente_id)
 
     try:
-        # Verificar si la sesión debe reiniciarse (solo si han pasado más de 24 horas)
+        # Reiniciar sesión si han pasado más de 24 horas
         if sesion.get("ts") and (datetime.utcnow() - sesion["ts"]) > timedelta(hours=24):
             logger.info(f"Sesión antigua detectada para {cliente_id}, reiniciando")
             sesion = {}
             guardar_sesion(cliente_id, sesion)
 
-        # Manejar mensajes post-confirmación primero
+        # Manejar mensajes post-confirmación
         if sesion.get("modelo_confirmado"):
             logger.info(f"Sesión ya confirmada para {cliente_id}: {sesion}")
             if any(keyword in texto for keyword in ["documentos", "requisitos", "papeles"]):
                 contexto = f"El cliente {sesion['nombre']} ha preguntado por documentos necesarios para la compra del modelo {sesion['modelo']}."
                 prompt = (
-                    f"{sesion['nombre']}, para la compra de tu {sesion['modelo']}, necesitarás los siguientes documentos: "
+                    f"{sesion['nombre']}, para comprar tu {sesion['modelo']} necesitas: "
                     "1) Identificación oficial (INE o pasaporte), "
-                    "2) Comprobante de domicilio (no mayor a 3 meses), "
+                    "2) Comprobante de domicilio (máximo 3 meses), "
                     "3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), "
                     "4) Solicitud de crédito (si aplica). "
-                    "Un ejecutivo te confirmará los detalles. ¿Hay algo más en lo que pueda ayudarte?"
+                    "Un ejecutivo te dará más detalles. ¿Algo más en lo que pueda ayudarte?"
                 )
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             else:
                 contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
-                prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
+                prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
-            #logger.info(f"Respuesta del webhook: {respuesta}")
+            logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
 
         # Manejar solicitud de hablar con un ejecutivo
         if "hablar con un ejecutivo" in texto or "ejecutivo" in texto:
             if "nombre" not in sesion:
                 contexto = "El cliente ha solicitado hablar con un ejecutivo, pero no ha proporcionado su nombre."
-                prompt = "Necesito tu nombre para asignarte un ejecutivo. 😊 Por favor, dime cómo te llamas."
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+                prompt = f"¡Bienvenido(a) a {AGENCIA}! 😊 ¿Me dices tu nombre, por favor?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
             else:
                 sesion["tipo_auto"] = sesion.get("tipo_auto", "no especificado")
                 sesion["modelo"] = sesion.get("modelo", "no especificado")
                 asignado = await send_to_next_advisor(cliente_id)
                 contexto = f"El cliente {sesion['nombre']} ha solicitado hablar con un ejecutivo."
-                prompt = f"{sesion['nombre']}, un ejecutivo te contactará pronto para ayudarte. ¿Hay algo más en lo que pueda ayudarte?"
+                prompt = f"{sesion['nombre']}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
 
-        # Manejar saludos iniciales, pero respetar la sesión existente
+        # Manejar frustración del cliente
+        if any(frase in texto for frase in ["ya te dije", "ya dije", "te dije"]):
+            if "nombre" in sesion and "tipo_auto" in sesion:
+                modelos = sesion.get("modelos", obtener_autos_nuevos() if sesion["tipo_auto"] == "nuevo" else obtener_autos_usados())
+                contexto = f"El cliente {sesion['nombre']} expresó frustración y ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra los modelos disponibles."
+                prompt = f"{sesion['nombre']}, disculpa la confusión. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
+            elif "nombre" in sesion:
+                contexto = f"El cliente {sesion['nombre']} expresó frustración y ya proporcionó su nombre. Pregunta por el tipo de auto."
+                prompt = f"{sesion['nombre']}, disculpa la confusión. ¿Buscas un auto nuevo o usado?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
+            else:
+                contexto = "El cliente expresó frustración, pero no ha proporcionado su nombre. Pide el nombre de forma amigable."
+                prompt = f"Disculpa la confusión. 😊 ¿Me dices tu nombre, por favor?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
+            logger.info(f"Respuesta del webhook: {respuesta}")
+            return respuesta
+
+        # Manejar saludos iniciales
         if texto in ["hola", "hi", "buenas"]:
             if "nombre" not in sesion:
-                contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
-                prompt = f"Bienvenido(a) a {AGENCIA}! 😊 Por favor, dime cómo te llamas."
+                contexto = "El cliente ha iniciado la conversación con un saludo. Pide su nombre de forma amigable."
+                prompt = f"¡Bienvenido(a) a {AGENCIA}! 😊 ¿Me dices tu nombre, por favor?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
             elif "tipo_auto" not in sesion:
-                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero no ha seleccionado tipo_auto. Pregunta si quiere un auto nuevo o usado."
+                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero no ha seleccionado tipo_auto. Pregunta por el tipo de auto."
                 prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
             elif "modelo" not in sesion:
                 modelos = sesion.get("modelos", obtener_autos_nuevos() if sesion["tipo_auto"] == "nuevo" else obtener_autos_usados())
-                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra todos los modelos: {', '.join(modelos)}."
+                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra los modelos disponibles."
                 prompt = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
             else:
                 contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó el modelo {sesion['modelo']}. Pide confirmación."
-                prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {sesion['modelo']}? Puedes cambiarlo si quieres."
+                prompt = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
@@ -424,7 +448,6 @@ async def webhook(req: Mensaje):
         if "nombre" not in sesion:
             nombre_valido = None
             texto_words = texto.split()
-            # Intentar tomar el nombre completo o la primera palabra válida
             if len(texto_words) >= 1:
                 nombre_candidato = " ".join(texto_words[:2])
                 if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ\s]{3,}$', nombre_candidato):
@@ -432,13 +455,12 @@ async def webhook(req: Mensaje):
             if nombre_valido:
                 sesion["nombre"] = nombre_valido
                 guardar_sesion(cliente_id, sesion)
-                contexto = f"El cliente ha proporcionado su nombre: {sesion['nombre']}. Pregunta si quiere un auto nuevo o usado."
+                contexto = f"El cliente ha proporcionado su nombre: {sesion['nombre']}. Pregunta por el tipo de auto."
                 prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
-                logger.info(f"Respuesta del webhook: {respuesta}")
             else:
-                contexto = "El cliente no ha proporcionado un nombre válido. Insiste en preguntar su nombre."
-                prompt = f"Necesito tu nombre para ayudarte mejor. 😊 Por favor, dime cómo te llamas (por ejemplo, Juan Pérez)."
+                contexto = "El cliente no ha proporcionado un nombre válido. Pide el nombre de forma amigable."
+                prompt = f"Disculpa, no entendí tu nombre. 😊 ¿Me dices cómo te llamas?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto, es_primer_mensaje=True), "botones": []}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
@@ -450,11 +472,11 @@ async def webhook(req: Mensaje):
                 modelos = obtener_autos_nuevos() if texto == "nuevo" else obtener_autos_usados()
                 sesion["modelos"] = modelos
                 guardar_sesion(cliente_id, sesion)
-                contexto = f"El cliente {sesion['nombre']} ha seleccionado tipo_auto {texto}. Muestra todos los modelos: {', '.join(modelos)}."
+                contexto = f"El cliente {sesion['nombre']} ha seleccionado tipo_auto {texto}. Muestra los modelos disponibles."
                 prompt = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
             else:
-                contexto = f"El cliente {sesion['nombre']} no ha especificado si quiere un auto nuevo o usado. Pregunta de manera clara."
+                contexto = f"El cliente {sesion['nombre']} no ha especificado si quiere un auto nuevo o usado. Pregunta de forma clara."
                 prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
             logger.info(f"Respuesta del webhook: {respuesta}")
@@ -465,61 +487,77 @@ async def webhook(req: Mensaje):
         modelos = sesion.get("modelos", obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados())
         if not modelos:
             contexto = f"No se pudieron obtener modelos de autos {tipo}. Informa al cliente y sugiere reintentar o contactar a un ejecutivo."
-            prompt = f"{sesion['nombre']}, parece que no tenemos la lista de modelos disponible ahora. ¿Quieres que lo intentemos de nuevo o prefieres hablar con un ejecutivo?"
+            prompt = f"{sesion['nombre']}, lo siento, no tenemos la lista de modelos disponible ahora. ¿Quieres intentar de nuevo o prefieres hablar con un ejecutivo?"
             respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Reintentar", "Hablar con ejecutivo"]}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
 
         # Confirmación de modelo
         if "modelo" in sesion and not sesion.get("modelo_confirmado"):
-            logger.info(f"Verificando confirmación: texto={texto}, sesion={sesion}")
-            if texto in ["sí", "si", "yes", "confirm"] or texto.lower() == "sí":
+            if texto in ["sí", "si", "yes", "confirm"]:
                 asignado = await send_to_next_advisor(cliente_id)
                 sesion["modelo_confirmado"] = True
                 guardar_sesion(cliente_id, sesion)
                 contexto = f"El cliente {sesion['nombre']} ha confirmado el modelo {sesion['modelo']}. Informa que un ejecutivo lo contactará."
-                prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto para ayudarte."
+                prompt = f"{sesion['nombre']}, tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
-                logger.info(f"Respuesta del webhook: {respuesta}")
-            elif texto in ["cambiar modelo", "cambiar", "otras opciones"]:
+            elif texto in ["no", "cambiar modelo", "cambiar", "otras opciones"]:
                 sesion.pop("modelo", None)
                 sesion.pop("modelo_confirmado", None)
+                modelos = obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados()
+                sesion["modelos"] = modelos
                 guardar_sesion(cliente_id, sesion)
-                contexto = f"El cliente {sesion['nombre']} quiere cambiar de modelo. Muestra todos los modelos {tipo}: {', '.join(modelos)}."
-                prompt = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                contexto = f"El cliente {sesion['nombre']} no confirmó el modelo y quiere elegir otro. Muestra los modelos disponibles."
+                prompt = f"{sesion['nombre']}, ¿cuál modelo prefieres? Estos son los disponibles: {', '.join(modelos)}."
                 respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
             else:
-                contexto = f"El cliente {sesion['nombre']} no ha confirmado el modelo {sesion['modelo']}. Pide confirmación."
-                prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {sesion['modelo']}? Puedes cambiarlo si quieres."
-                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
+                # Verificar si el cliente insiste en un modelo
+                modelo_seleccionado = None
+                texto_lower = texto.lower().replace(".", "").replace(" ", "")
+                for m in modelos:
+                    model_parts = m.lower().split()
+                    key_model_name = model_parts[0] if tipo == "usado" else m.lower()
+                    key_model_name_normalized = key_model_name.replace(".", "").replace(" ", "")
+                    if texto_lower == key_model_name_normalized or texto_lower in m.lower().replace(".", "").replace(" ", ""):
+                        modelo_seleccionado = m
+                        break
+                    if levenshtein_distance(key_model_name_normalized, texto_lower) <= 3 and texto not in ["nuevo", "usado", "sí", "si", "yes", "confirm", "no"]:
+                        modelo_seleccionado = m
+                        break
+                if modelo_seleccionado:
+                    sesion["modelo"] = modelo_seleccionado
+                    guardar_sesion(cliente_id, sesion)
+                    contexto = f"El cliente {sesion['nombre']} insistió en el modelo {modelo_seleccionado}. Pide confirmación."
+                    prompt = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {modelo_seleccionado}? Si prefieres otro, dime cuál."
+                    respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
+                else:
+                    contexto = f"El cliente {sesion['nombre']} no ha confirmado el modelo {sesion['modelo']}. Pide confirmación."
+                    prompt = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
+                    respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
 
-        # Selección de modelo con tolerancia a errores tipográficos
+        # Selección de modelo
         modelo_seleccionado = None
         texto_lower = texto.lower().replace(".", "").replace(" ", "")
         for m in modelos:
             model_parts = m.lower().split()
             key_model_name = model_parts[0] if tipo == "usado" else m.lower()
             key_model_name_normalized = key_model_name.replace(".", "").replace(" ", "")
-            if key_model_name_normalized == texto_lower or m.lower().replace(".", "").replace(" ", "") == texto_lower:
+            if texto_lower == key_model_name_normalized or texto_lower in m.lower().replace(".", "").replace(" ", ""):
                 modelo_seleccionado = m
                 break
-            if levenshtein_distance(key_model_name_normalized, texto_lower) <= 3 and texto not in ["nuevo", "usado"]:
+            if levenshtein_distance(key_model_name_normalized, texto_lower) <= 3 and texto not in ["nuevo", "usado", "sí", "si", "yes", "confirm", "no"]:
                 modelo_seleccionado = m
                 break
-        logger.info(f"Modelos disponibles: {modelos}, Texto: {texto}, Modelo seleccionado: {modelo_seleccionado}")
-
-
         if modelo_seleccionado:
             sesion["modelo"] = modelo_seleccionado
             guardar_sesion(cliente_id, sesion)
             contexto = f"El cliente {sesion['nombre']} ha seleccionado el modelo {modelo_seleccionado}. Pide confirmación."
-            prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {modelo_seleccionado}? Puedes cambiarlo si quieres."
+            prompt = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {modelo_seleccionado}? Si prefieres otro, dime cuál."
             respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
-            logger.info(f"Respuesta del webhook: {respuesta}")
         else:
-            contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo válido. Muestra todos los modelos {tipo}: {', '.join(modelos)}."
+            contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo válido. Muestra los modelos disponibles."
             prompt = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
             respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos}
         logger.info(f"Respuesta del webhook: {respuesta}")
@@ -527,7 +565,7 @@ async def webhook(req: Mensaje):
 
     except Exception as e:
         logger.error(f"Error en el endpoint /webhook: {str(e)}", exc_info=True)
-        respuesta = {"texto": "Lo siento, ocurrió un error en el servidor. Por favor, intenta de nuevo.", "botones": []}
+        respuesta = {"texto": "Disculpa, algo salió mal. 😊 Por favor, intenta de nuevo.", "botones": []}
         logger.info(f"Respuesta del webhook (error): {respuesta}")
         return respuesta
 
@@ -540,7 +578,6 @@ scheduler.start()
 
 if __name__ == "__main__":
     import uvicorn
-    # Forzar actualización del caché al iniciar
     obtener_autos_nuevos(force_refresh=True)
     obtener_autos_usados(force_refresh=True)
     uvicorn.run(app, host="0.0.0.0", port=5000)
