@@ -102,6 +102,8 @@ def obtener_sesion(cliente_id):
     try:
         sesion = sesiones_col.find_one({"cliente_id": cliente_id}) or {}
         logger.info(f"Sesión recuperada para {cliente_id}: {sesion}")
+        if not sesion:
+            logger.warning(f"No se encontró sesión para {cliente_id}, devolviendo sesión vacía")
         return sesion
     except Exception as e:
         logger.error(f"Error al obtener sesión para {cliente_id}: {e}")
@@ -168,7 +170,7 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None):
 
 # ------------------------------
 # Asignación de ejecutivo con reintentos
-# ------------------------------
+# ----------------------
 async def enviar_a_ejecutivo(cliente_id, info_cliente):
     try:
         for ejecutivo in EJECUTIVOS:
@@ -204,18 +206,51 @@ async def webhook(req: Mensaje):
     sesion = obtener_sesion(cliente_id)
 
     try:
-        # Verificar si la sesión debe reiniciarse (opcional: si han pasado más de 24 horas)
+        # Verificar si la sesión debe reiniciarse (solo si han pasado más de 24 horas)
         if sesion.get("ts") and (datetime.utcnow() - sesion["ts"]) > timedelta(hours=24):
             logger.info(f"Sesión antigua detectada para {cliente_id}, reiniciando")
             sesion = {}
             guardar_sesion(cliente_id, sesion)
 
-        if not texto or texto in ["hola", "hi", "buenas"]:
-            contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
-            prompt = f"Hola, bienvenido(a) a {AGENCIA}! 👋 ¿Cómo te llamas?"
+        # Manejar mensajes post-confirmación primero
+        if "modelo_confirmado" in sesion and sesion["modelo_confirmado"]:
+            logger.info(f"Sesión ya confirmada para {cliente_id}: {sesion}")
+            contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
+            prompt = f"{sesion['nombre']}, ya hemos registrado tu interés en el modelo {sesion['modelo']}. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
             respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
             logger.info(f"Respuesta del webhook: {respuesta}")
             return respuesta
+
+        # Manejar saludos iniciales, pero respetar la sesión existente
+        if texto in ["hola", "hi", "buenas"]:
+            if "nombre" in sesion and "tipo_auto" in sesion and "modelo" in sesion:
+                logger.info(f"Sesión existente con modelo seleccionado para {cliente_id}: {sesion}")
+                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó el modelo {sesion['modelo']}. Pide confirmación."
+                prompt = f"{sesion['nombre']}, confirmas que deseas el modelo {sesion['modelo']}? Puedes cambiarlo si quieres."
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Sí", "Cambiar modelo"]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+            elif "nombre" in sesion and "tipo_auto" in sesion:
+                logger.info(f"Sesión existente con tipo_auto para {cliente_id}: {sesion}")
+                modelos = sesion.get("modelos", obtener_autos_nuevos() if sesion["tipo_auto"] == "nuevo" else obtener_autos_usados())
+                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra modelos: {', '.join(modelos[:5])}."
+                prompt = f"{sesion['nombre']}, estos son algunos modelos disponibles: {', '.join(modelos[:5])}. ¿Cuál te interesa?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": modelos[:5]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+            elif "nombre" in sesion:
+                logger.info(f"Sesión existente con nombre para {cliente_id}: {sesion}")
+                contexto = f"El cliente {sesion['nombre']} ha enviado un saludo, pero no ha seleccionado tipo_auto. Pregunta si quiere un auto nuevo o usado."
+                prompt = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": ["Nuevo", "Usado"]}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
+            else:
+                contexto = "El cliente ha iniciado la conversación con un saludo genérico. Responde amigablemente y pregunta su nombre."
+                prompt = f"Hola, bienvenido(a) a {AGENCIA}! 👋 ¿Cómo te llamas?"
+                respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
+                logger.info(f"Respuesta del webhook: {respuesta}")
+                return respuesta
 
         if "nombre" not in sesion:
             palabras = [p for p in texto.split() if p.isalpha() and p not in ["nuevo", "usado", "auto", "coche", "vehiculo", "quiero", "busco", "asi", "es", "mi", "nombre"]]
@@ -259,15 +294,6 @@ async def webhook(req: Mensaje):
 
         sesion["modelos"] = modelos
         guardar_sesion(cliente_id, sesion)
-
-        # Manejar mensajes post-confirmación
-        if "modelo_confirmado" in sesion and sesion["modelo_confirmado"]:
-            logger.info(f"Sesión ya confirmada para {cliente_id}: {sesion}")
-            contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente y sugiere esperar al ejecutivo."
-            prompt = f"{sesion['nombre']}, ya hemos registrado tu interés en el modelo {sesion['modelo']}. Un ejecutivo te contactará pronto. ¿Hay algo más en lo que pueda ayudarte?"
-            respuesta = {"texto": generar_respuesta_ollama(prompt, contexto), "botones": []}
-            logger.info(f"Respuesta del webhook: {respuesta}")
-            return respuesta
 
         # Priorizar confirmación si ya hay un modelo seleccionado
         if "modelo" in sesion and "modelo_confirmado" not in sesion:
