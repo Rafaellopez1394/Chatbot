@@ -351,11 +351,11 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             "No uses emojis ni exclamaciones iniciales (e.g., '¡{nombre}, ...') en ninguna respuesta después del mensaje inicial. "
             "Si el cliente selecciona un modelo no disponible, responde SOLO: '{nombre}, lo siento, ese modelo no está disponible. Estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
             "Si el cliente dice 'no' al confirmar un modelo, responde SOLO: '{nombre}, ¿cuál modelo prefieres? Estos son los disponibles: {modelos}.' "
-            "Si el cliente expresa frustración (e.g., 'ya te dije', 'ya dije', 'no me ha contactado', 'nadie me ha contactado', 'ya paso rato', '🙃', '🙄'), discúlpate y retoma el último paso: "
-            "   - Si tienes nombre, tipo de auto y modelo confirmado, responde: '{nombre}, disculpa la confusión. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?' "
-            "   - Si tienes nombre y tipo de auto, muestra los modelos: '{nombre}, disculpa la confusión. Estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
-            "   - Si tienes solo el nombre, pregunta: '{nombre}, disculpa la confusión. ¿Buscas un auto nuevo o usado?' "
-            "   - Si no tienes nada, pregunta: 'Disculpa la confusión. ¿Me puedes proporcionar tu nombre, por favor?' "
+            "Si el cliente expresa frustración (e.g., 'ya te dije', 'ya dije', 'no me ha contactado','no me han contactado', 'nadie me ha contactado', 'no me han atendido', 'ya paso rato', '🙃', '🙄'), discúlpate y retoma el último paso: "
+            "   - Si tiene nombre, tipo de auto y modelo confirmado, responde: '{nombre}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Algo más en lo que pueda ayudarte?' "
+            "   - Si tiene nombre y tipo de auto, muestra los modelos: '{nombre}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. Estos son los modelos disponibles: {modelos}. ¿Cuál te interesa?' "
+            "   - Si tiene solo el nombre, pregunta: '{nombre}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Buscas un auto nuevo o usado?' "
+            "   - Si no tiene nada, pregunta: 'Disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Me puedes proporcionar tu nombre, por favor?' "
             "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', responde SOLO: '{nombre}, para comprar tu {modelo} necesitas: 1) Identificación oficial (INE o pasaporte), 2) Comprobante de domicilio (máximo 3 meses), 3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), 4) Solicitud de crédito (si aplica). Un ejecutivo te dará más detalles. ¿Algo más en lo que pueda ayudarte?' "
             "Si el cliente pide 'hablar con un ejecutivo', verifica si tienes su nombre; if not, respond: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me puedes proporcionar tu nombre, por favor?' Then, respond ONLY: '{nombre}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?' "
             "If the client says 'gracias', 'no, gracias' or similar after confirming a model, respond ONLY: 'De nada, {nombre}. Pronto uno de nuestros ejecutivos se pondrá en contacto contigo.' "
@@ -422,9 +422,9 @@ async def webhook(req: Mensaje):
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
-            elif any(keyword in texto.lower() for keyword in ["no me ha contactado", "nadie me ha contactado", "ya paso rato", "🙃", "🙄"]):
-                contexto = f"El cliente {sesion['nombre']} expresó frustración porque no ha sido contactado después de confirmar el modelo {sesion['modelo']}."
-                expected_response = f"{sesion['nombre']}, disculpa la confusión. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
+            elif any(keyword in texto.lower() for keyword in ["no me ha contactado", "nadie me ha contactado", "no me han atendido","no me han contactado"]):
+                contexto = f"El cliente {sesion['nombre']} expresó que no ha recibido atención después de confirmar el modelo {sesion['modelo']}."
+                expected_response = f"{sesion['nombre']}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Algo más en lo que pueda ayudarte?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
@@ -467,29 +467,29 @@ async def webhook(req: Mensaje):
                 return {"texto": respuesta, "botones": botones}
 
         # Manejar frustración del cliente
-        if any(frase in texto.lower() for frase in ["ya te dije", "ya dije", "te dije", "no me ha contactado", "nadie me ha contactado", "🙄"]):
+        if any(frase in texto.lower() for frase in ["ya te dije", "ya dije", "te dije", "no me ha contactado", "nadie me ha contactado", "no me han atendido", "🙄"]):
             if "nombre" in sesion and "tipo_auto" in sesion and "modelo" in sesion and sesion.get("modelo_confirmado"):
                 contexto = f"El cliente {sesion['nombre']} expresó frustración porque no ha sido contactado después de confirmar el modelo {sesion['modelo']}."
-                expected_response = f"{sesion['nombre']}, disculpa la confusión. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
+                expected_response = f"{sesion['nombre']}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Algo más en lo que pueda ayudarte?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             elif "nombre" in sesion and "tipo_auto" in sesion:
                 modelos = sesion.get("modelos", obtener_autos_nuevos() if sesion["tipo_auto"] == "nuevo" else obtener_autos_usados())
                 contexto = f"El cliente {sesion['nombre']} expresó frustración y ya seleccionó tipo_auto {sesion['tipo_auto']}. Muestra los modelos disponibles."
-                expected_response = f"{sesion['nombre']}, disculpa la confusión. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                expected_response = f"{sesion['nombre']}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, modelos[:5])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             elif "nombre" in sesion:
                 contexto = f"El cliente {sesion['nombre']} expresó frustración y ya proporcionó su nombre. Pregunta por el tipo de auto."
-                expected_response = f"{sesion['nombre']}, disculpa la confusión. ¿Buscas un auto nuevo o usado?"
+                expected_response = f"{sesion['nombre']}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Buscas un auto nuevo o usado?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Nuevo", "Usado"])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             else:
                 contexto = "El cliente expresó frustración, pero no ha proporcionado su nombre. Pide el nombre de forma amigable."
-                expected_response = f"Disculpa la confusión. ¿Me puedes proporcionar tu nombre, por favor?"
+                expected_response = f"Disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Me puedes proporcionar tu nombre, por favor?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, True, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
