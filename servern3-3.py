@@ -217,8 +217,8 @@ def guardar_bitacora(registro):
 @app.get("/get_asesores")
 def get_asesores():
     try:
-        asesores = list(asesores_col.find({"activo": True}, {"telefono": 1, "_id": 0}))
-        return [a["telefono"] for a in asesores if "telefono" in a]
+        asesores = list(asesores_col.find({"activo": True}, {"telefono": 1, "nombre": 1, "_id": 0}))
+        return [{"telefono": a["telefono"], "nombre": a.get("nombre", "Asesor Desconocido")} for a in asesores if "telefono" in a]
     except Exception as e:
         logger.error(f"Error al obtener asesores: {e}", exc_info=True)
         return []
@@ -231,14 +231,15 @@ async def send_to_next_advisor(client_id):
             return False
         active_advisors = get_asesores()
         assigned_advisors = sesion.get("assigned_advisors", [])
-        next_advisor = next((advisor for advisor in active_advisors if advisor not in assigned_advisors), None)
+        next_advisor = next((advisor for advisor in active_advisors if advisor["telefono"] not in assigned_advisors), None)
         if next_advisor:
-            assigned_advisors.append(next_advisor)
+            assigned_advisors.append(next_advisor["telefono"])
             sesion["assigned_advisors"] = assigned_advisors
+            sesion["asesor_nombre"] = next_advisor["nombre"]  # Guardar el nombre del asesor en la sesión
             guardar_sesion(client_id, sesion)
-            message = f"Cliente: {sesion['nombre']} busca {sesion['tipo_auto']} {sesion['modelo']}, contacto: {client_id}. ¿Disponible?"
+            message = f"Cliente: {sesion['nombre']} busca {sesion['tipo_auto']} {sesion['modelo']}, contacto: {client_id}. ¿Disponible? Asesor asignado: {next_advisor['nombre']}"
             sends_col.insert_one({
-                "jid": f"{next_advisor}@s.whatsapp.net",
+                "jid": f"{next_advisor['telefono']}@s.whatsapp.net",
                 "message": message,
                 "buttons": [
                     {"buttonId": f"yes_{client_id}", "buttonText": {"displayText": "Sí"}, "type": 1},
@@ -249,12 +250,13 @@ async def send_to_next_advisor(client_id):
             })
             assignments_col.insert_one({
                 "client_id": client_id,
-                "advisor_phone": next_advisor,
+                "advisor_phone": next_advisor["telefono"],
+                "advisor_name": next_advisor["nombre"],  # Guardar el nombre del asesor
                 "sent_time": datetime.utcnow(),
                 "status": "pending"
             })
-            scheduler.add_job(check_timeout, 'date', run_date=datetime.utcnow() + timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO), args=[client_id, next_advisor])
-            logger.info(f"Mensaje enviado a {next_advisor} para cliente {client_id}")
+            scheduler.add_job(check_timeout, 'date', run_date=datetime.utcnow() + timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO), args=[client_id, next_advisor["telefono"]])
+            logger.info(f"Mensaje enviado a {next_advisor['nombre']} ({next_advisor['telefono']}) para cliente {client_id}")
             return True
         else:
             logger.warning(f"No hay asesores disponibles para {client_id}")
@@ -301,18 +303,18 @@ async def advisor_response(req: AdvisorResponse):
                 "tipo_auto": sesion["tipo_auto"],
                 "modelo": sesion["modelo"],
                 "contacto": cliente_id,
-                "ejecutivo": asesor_phone,
+                "ejecutivo": assignment["advisor_name"],
                 "fecha": datetime.utcnow().strftime("%Y-%m-%d"),
                 "hora": datetime.utcnow().strftime("%H:%M:%S")
             }
             guardar_bitacora(info_cliente)
-            client_message = f"{sesion['nombre']}, tu interés en el {sesion['tipo_auto']} {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto."
+            client_message = f"{sesion['nombre']}, tu interés en el {sesion['tipo_auto']} {sesion['modelo']} está registrado. El ejecutivo {assignment['advisor_name']} te contactará pronto."
             sends_col.insert_one({
                 "jid": cliente_id,
                 "message": client_message,
                 "sent": False
             })
-            summary = f"Cliente: {info_cliente['nombre']}, busca {info_cliente['tipo_auto']} {info_cliente['modelo']}, contacto: {info_cliente['contacto']}"
+            summary = f"Cliente: {info_cliente['nombre']}, busca {info_cliente['tipo_auto']} {info_cliente['modelo']}, contacto: {info_cliente['contacto']}. Asesor asignado: {info_cliente['ejecutivo']}"
             sends_col.insert_one({
                 "jid": f"{asesor_phone}@s.whatsapp.net",
                 "message": summary,
@@ -360,6 +362,9 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             "Si el cliente pide 'hablar con un ejecutivo', verifica si tienes su nombre; if not, respond: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me puedes proporcionar tu nombre, por favor?' Then, respond ONLY: '{nombre}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?' "
             "If the client says 'gracias', 'no, gracias' or similar after confirming a model, respond ONLY: 'De nada, {nombre}. Pronto uno de nuestros ejecutivos se pondrá en contacto contigo.' "
             "If the client sends greetings (e.g., 'hola', 'hi') after confirming a model, respond ONLY: 'Hola {nombre}. Tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?'"
+            "Si el cliente pregunta 'cuál es el nombre del asesor?','cuál es el nombre del ejecutivo?', 'en qué tanto tiempo me contactarán?' o 'en cuanto tiempo?', responde SOLO: "
+            "   - Para 'cuál es el nombre del asesor?' o 'ejecutivo': '{nombre}, no tengo el nombre del asesor asignado aún, ya que se determina cuando un ejecutivo esté disponible. Te informaré cuando te contacten.' "
+            "   - Para 'en qué tanto tiempo me contactarán?' o 'en cuanto tiempo?': '{nombre}, te contactarán lo antes posible, generalmente dentro de unos 5 a 10 minutos una vez que un asesor se desocupe.' "
         )
         if es_primer_mensaje:
             system_prompt += "\nUsa SOLO este mensaje inicial: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! Soy {BOT_NOMBRE} 😊 ¿Me puedes proporcionar tu nombre, por favor?'"
