@@ -11,6 +11,7 @@ import asyncio
 from ollama import GenerateResponse
 from Levenshtein import distance as levenshtein_distance
 import re
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ------------------------------
 # Configuración básica
@@ -36,8 +37,12 @@ cache_col = db["cache"]
 sesiones_col = db["sesiones"]
 bitacora_col = db["bitacora"]
 asesores_col = db["asesores"]
-assignments_col = db["assignments"]
 sends_col = db["sends"]
+assignments_col = db["assignments"]
+bitacora_col = db["bitacora"]
+
+# Configuración del scheduler
+scheduler = AsyncIOScheduler()
 
 BOT_NOMBRE = "Alex"
 AGENCIA = "Volkswagen Eurocity Culiacán"
@@ -246,7 +251,8 @@ async def send_to_next_advisor(client_id):
                 advisor_jid = f"521{advisor_jid}"
             advisor_jid = f"{advisor_jid}@s.whatsapp.net"
             logger.info(f"Generando jid para asesor: {advisor_jid}")
-            message = f"Cliente: {sesion['nombre']} busca {sesion['tipo_auto']} {sesion['modelo']}, contacto: {client_id}. ¿Disponible? Asesor asignado: {next_advisor['nombre']}"
+# Preguntar solo por disponibilidad
+            message = f"Hola {next_advisor['nombre']}, ¿estás disponible para atender a un cliente ahora?"
             sends_col.insert_one({
                 "jid": advisor_jid,
                 "message": message,
@@ -255,26 +261,35 @@ async def send_to_next_advisor(client_id):
                     {"buttonId": f"no_{client_id}", "buttonText": {"displayText": "No"}, "type": 1}
                 ],
                 "sent": False,
-                "sent_time": datetime.utcnow()
+                "sent_time": datetime.utcnow(),
+                "client_id": client_id
             })
             assignment_id = assignments_col.insert_one({
                 "client_id": client_id,
                 "advisor_phone": next_advisor["telefono"],
                 "advisor_name": next_advisor["nombre"],
                 "sent_time": datetime.utcnow(),
-                "status": "pending"
+                "status": "pending_availability"
             }).inserted_id
-            # Guardar en bitácora el evento de pregunta al asesor
+            # Guardar en bitácora la pregunta de disponibilidad
             guardar_bitacora({
-                "event": "asked_advisor",
+                "event": "asked_availability",
                 "client_id": client_id,
                 "advisor_phone": next_advisor["telefono"],
                 "advisor_name": next_advisor["nombre"],
                 "ask_time": datetime.utcnow(),
                 "message": message
             })
-            scheduler.add_job(check_timeout, 'date', run_date=datetime.utcnow() + timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO), args=[client_id, next_advisor["telefono"]])
-            logger.info(f"Mensaje preparado para {next_advisor['nombre']} ({advisor_jid}) para cliente {client_id}")
+            
+            logger.info(f"Programando timeout para cliente {client_id}, asesor {next_advisor['telefono']} en {TIEMPO_RESPUESTA_EJECUTIVO} segundos")
+            scheduler.add_job(
+                check_timeout,
+                'date',
+                run_date=datetime.utcnow() + timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO),
+                args=[client_id, next_advisor["telefono"], assignment_id],
+                id=f"timeout_{client_id}_{next_advisor['telefono']}"
+            )
+            logger.info(f"Pregunta de disponibilidad enviada a {next_advisor['nombre']} ({advisor_jid}) para cliente {client_id}")
             return True
         else:
             logger.warning(f"No hay asesores disponibles para {client_id}")
@@ -282,6 +297,12 @@ async def send_to_next_advisor(client_id):
                 "jid": client_id,
                 "message": f"{sesion['nombre']}, lo siento, no hay ejecutivos disponibles ahora. Por favor, intenta de nuevo más tarde.",
                 "sent": False
+            })
+            # Guardar en bitácora que no hay asesores disponibles
+            guardar_bitacora({
+                "event": "no_advisors_available",
+                "client_id": client_id,
+                "time": datetime.utcnow()
             })
             return False
     except Exception as e:
@@ -291,27 +312,49 @@ async def send_to_next_advisor(client_id):
             "message": f"{sesion.get('nombre', 'Cliente')}, lo siento, ocurrió un error al asignar un ejecutivo. Por favor, intenta de nuevo.",
             "sent": False
         })
+        # Guardar en bitácora el error
+        guardar_bitacora({
+            "event": "error_assigning_advisor",
+            "client_id": client_id,
+            "error": str(e),
+            "time": datetime.utcnow()
+        })
         return False
 
-def check_timeout(client_id, advisor_phone):
+async def check_timeout(client_id, advisor_phone, assignment_id):
     try:
-        assignment = assignments_col.find_one({"client_id": client_id, "advisor_phone": advisor_phone, "status": "pending"})
-        if assignment and (datetime.utcnow() - assignment["sent_time"]) >= timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO):
+        logger.info(f"Verificando timeout para cliente {client_id}, asesor {advisor_phone}, assignment_id {assignment_id}")
+        assignment = assignments_col.find_one({"_id": assignment_id, "client_id": client_id, "advisor_phone": advisor_phone, "status": "pending_availability"})
+        if assignment:
             now = datetime.utcnow()
-            assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": "timeout", "response_time": now}})
-            # Guardar en bitácora el timeout
-            guardar_bitacora({
-                "event": "advisor_timeout",
-                "client_id": client_id,
-                "advisor_phone": advisor_phone,
-                "advisor_name": assignment["advisor_name"],
-                "timeout_time": now,
-                "original_ask_time": assignment["sent_time"]
-            })
-            logger.info(f"Timeout para {advisor_phone} con cliente {client_id}, intentando siguiente asesor")
-            asyncio.run(send_to_next_advisor(client_id))
+            time_elapsed = (now - assignment["sent_time"]).total_seconds()
+            logger.info(f"Tiempo transcurrido para {client_id} con asesor {advisor_phone}: {time_elapsed} segundos")
+            if time_elapsed >= TIEMPO_RESPUESTA_EJECUTIVO:
+                assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": "timeout", "response_time": now}})
+                guardar_bitacora({
+                    "event": "advisor_timeout",
+                    "client_id": client_id,
+                    "advisor_phone": advisor_phone,
+                    "advisor_name": assignment["advisor_name"],
+                    "timeout_time": now,
+                    "original_ask_time": assignment["sent_time"]
+                })
+                logger.info(f"Timeout para {advisor_phone} con cliente {client_id}, intentando siguiente asesor")
+                await send_to_next_advisor(client_id)
+            else:
+                logger.info(f"Tiempo no alcanzado para {client_id} con {advisor_phone}, tiempo restante: {TIEMPO_RESPUESTA_EJECUTIVO - time_elapsed} segundos")
+        else:
+            logger.warning(f"No se encontró asignación pendiente para cliente {client_id}, asesor {advisor_phone}, assignment_id {assignment_id}")
     except Exception as e:
         logger.error(f"Error en check_timeout para {client_id}, asesor {advisor_phone}: {e}", exc_info=True)
+        # Guardar en bitácora el error
+        guardar_bitacora({
+            "event": "error_timeout_check",
+            "client_id": client_id,
+            "advisor_phone": advisor_phone,
+            "error": str(e),
+            "time": datetime.utcnow()
+        })
 
 @app.post("/advisor_response")
 async def advisor_response(req: AdvisorResponse):
@@ -319,15 +362,14 @@ async def advisor_response(req: AdvisorResponse):
         cliente_id = req.cliente_id
         respuesta = req.respuesta.lower()
         asesor_phone = req.asesor_phone
-        assignment = assignments_col.find_one({"client_id": cliente_id, "advisor_phone": asesor_phone, "status": "pending"})
+        assignment = assignments_col.find_one({"client_id": cliente_id, "advisor_phone": asesor_phone, "status": "pending_availability"})
         if not assignment:
             logger.warning(f"No se encontró asignación pendiente para cliente {cliente_id} y asesor {asesor_phone}")
             return {"texto": "Asignación no encontrada"}
         now = datetime.utcnow()
-        assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": respuesta, "response_time": now}})
         # Guardar en bitácora la respuesta del asesor
         guardar_bitacora({
-            "event": "advisor_response",
+            "event": "advisor_availability_response",
             "client_id": cliente_id,
             "advisor_phone": asesor_phone,
             "advisor_name": assignment["advisor_name"],
@@ -335,18 +377,41 @@ async def advisor_response(req: AdvisorResponse):
             "response_time": now,
             "original_ask_time": assignment["sent_time"]
         })
-        sesion = obtener_sesion(cliente_id)
         if respuesta == "yes":
+            sesion = obtener_sesion(cliente_id)
+            assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": "accepted", "response_time": now}})
+            # Enviar información del cliente al asesor
+            advisor_jid = asesor_phone if asesor_phone.startswith("521") else f"521{asesor_phone}"
+            advisor_jid = f"{advisor_jid}@s.whatsapp.net"
+            client_summary = (
+                f"Cliente: {sesion['nombre']} busca {sesion['tipo_auto']} {sesion['modelo']}, "
+                f"contacto: {cliente_id}. Asesor asignado: {assignment['advisor_name']}"
+            )
+            sends_col.insert_one({
+                "jid": advisor_jid,
+                "message": client_summary,
+                "sent": False,
+                "sent_time": datetime.utcnow()
+            })
+            # Guardar en bitácora el envío de información del cliente
+            guardar_bitacora({
+                "event": "client_info_sent",
+                "client_id": cliente_id,
+                "advisor_phone": asesor_phone,
+                "advisor_name": assignment["advisor_name"],
+                "sent_time": now,
+                "message": client_summary
+            })
+            # Registrar asignación final
             info_cliente = {
                 "nombre": sesion["nombre"],
                 "tipo_auto": sesion["tipo_auto"],
                 "modelo": sesion["modelo"],
                 "contacto": cliente_id,
                 "ejecutivo": assignment["advisor_name"],
-                "fecha": datetime.utcnow().strftime("%Y-%m-%d"),
-                "hora": datetime.utcnow().strftime("%H:%M:%S")
+                "fecha": now.strftime("%Y-%m-%d"),
+                "hora": now.strftime("%H:%M:%S")
             }
-            # Guardar en bitácora la asignación final
             guardar_bitacora({
                 "event": "client_assigned",
                 "client_id": cliente_id,
@@ -355,27 +420,34 @@ async def advisor_response(req: AdvisorResponse):
                 "assignment_time": now,
                 "client_info": info_cliente
             })
-            client_message = f"{sesion['nombre']}, tu interés en el {sesion['tipo_auto']} {sesion['modelo']} está registrado. El ejecutivo {assignment['advisor_name']} te contactará pronto."
+            client_message = (
+                f"{sesion['nombre']}, tu interés en el {sesion['tipo_auto']} {sesion['modelo']} está registrado. "
+                f"El ejecutivo {assignment['advisor_name']} te contactará pronto."
+            )
             sends_col.insert_one({
                 "jid": cliente_id,
                 "message": client_message,
                 "sent": False
             })
-            summary = f"Cliente: {info_cliente['nombre']}, busca {info_cliente['tipo_auto']} {info_cliente['modelo']}, contacto: {info_cliente['contacto']}. Asesor asignado: {info_cliente['ejecutivo']}"
-            sends_col.insert_one({
-                "jid": f"{asesor_phone}@s.whatsapp.net",
-                "message": summary,
-                "sent": False
-            })
             sesion["modelo_confirmado"] = True
             guardar_sesion(cliente_id, sesion)
-        else:  # "no" u otra respuesta
+        else:  # Respuesta "no" u otra
+            assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": "declined", "response_time": now}})
             logger.info(f"Asesor {asesor_phone} no disponible, intentando siguiente asesor para {cliente_id}")
             await send_to_next_advisor(cliente_id)
         return {"texto": "Respuesta registrada"}
     except Exception as e:
         logger.error(f"Error en advisor_response: {e}", exc_info=True)
+        # Guardar en bitácora el error
+        guardar_bitacora({
+            "event": "error_advisor_response",
+            "client_id": cliente_id,
+            "advisor_phone": asesor_phone,
+            "error": str(e),
+            "time": datetime.utcnow()
+        })
         return {"texto": "Error al procesar la respuesta del asesor"}
+
 
 # ------------------------------
 # Generación de respuesta con Ollama
