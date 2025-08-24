@@ -74,6 +74,7 @@ def normalizar_modelo(modelo):
     for prefix in ["volkswagen", "nuevo", "nueva"]:
         modelo = modelo.replace(prefix, "").strip()
     # Corregir errores conocidos
+    modelo = re.sub(r'\s*\(\d{4}\)', '', modelo).strip()
     correcciones = {
         "tera": "Teramont",
         "taigun": "Tiguan",
@@ -218,6 +219,9 @@ def guardar_bitacora(registro):
 def get_asesores():
     try:
         asesores = list(asesores_col.find({"activo": True}, {"telefono": 1, "nombre": 1, "_id": 0}))
+        for advisor in asesores:
+            if not advisor["telefono"].startswith("521"):
+                advisor["telefono"] = f"521{advisor['telefono']}"
         return [{"telefono": a["telefono"], "nombre": a.get("nombre", "Asesor Desconocido")} for a in asesores if "telefono" in a]
     except Exception as e:
         logger.error(f"Error al obtener asesores: {e}", exc_info=True)
@@ -235,11 +239,16 @@ async def send_to_next_advisor(client_id):
         if next_advisor:
             assigned_advisors.append(next_advisor["telefono"])
             sesion["assigned_advisors"] = assigned_advisors
-            sesion["asesor_nombre"] = next_advisor["nombre"]  # Guardar el nombre del asesor en la sesión
+            sesion["asesor_nombre"] = next_advisor["nombre"]
             guardar_sesion(client_id, sesion)
+            advisor_jid = next_advisor["telefono"]
+            if not advisor_jid.startswith("521"):
+                advisor_jid = f"521{advisor_jid}"
+            advisor_jid = f"{advisor_jid}@s.whatsapp.net"
+            logger.info(f"Generando jid para asesor: {advisor_jid}")
             message = f"Cliente: {sesion['nombre']} busca {sesion['tipo_auto']} {sesion['modelo']}, contacto: {client_id}. ¿Disponible? Asesor asignado: {next_advisor['nombre']}"
             sends_col.insert_one({
-                "jid": f"{next_advisor['telefono']}@s.whatsapp.net",
+                "jid": advisor_jid,
                 "message": message,
                 "buttons": [
                     {"buttonId": f"yes_{client_id}", "buttonText": {"displayText": "Sí"}, "type": 1},
@@ -248,15 +257,24 @@ async def send_to_next_advisor(client_id):
                 "sent": False,
                 "sent_time": datetime.utcnow()
             })
-            assignments_col.insert_one({
+            assignment_id = assignments_col.insert_one({
                 "client_id": client_id,
                 "advisor_phone": next_advisor["telefono"],
-                "advisor_name": next_advisor["nombre"],  # Guardar el nombre del asesor
+                "advisor_name": next_advisor["nombre"],
                 "sent_time": datetime.utcnow(),
                 "status": "pending"
+            }).inserted_id
+            # Guardar en bitácora el evento de pregunta al asesor
+            guardar_bitacora({
+                "event": "asked_advisor",
+                "client_id": client_id,
+                "advisor_phone": next_advisor["telefono"],
+                "advisor_name": next_advisor["nombre"],
+                "ask_time": datetime.utcnow(),
+                "message": message
             })
             scheduler.add_job(check_timeout, 'date', run_date=datetime.utcnow() + timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO), args=[client_id, next_advisor["telefono"]])
-            logger.info(f"Mensaje enviado a {next_advisor['nombre']} ({next_advisor['telefono']}) para cliente {client_id}")
+            logger.info(f"Mensaje preparado para {next_advisor['nombre']} ({advisor_jid}) para cliente {client_id}")
             return True
         else:
             logger.warning(f"No hay asesores disponibles para {client_id}")
@@ -275,15 +293,25 @@ async def send_to_next_advisor(client_id):
         })
         return False
 
-def check_timeout(client_id, advisor):
+def check_timeout(client_id, advisor_phone):
     try:
-        assignment = assignments_col.find_one({"client_id": client_id, "advisor_phone": advisor, "status": "pending"})
+        assignment = assignments_col.find_one({"client_id": client_id, "advisor_phone": advisor_phone, "status": "pending"})
         if assignment and (datetime.utcnow() - assignment["sent_time"]) >= timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO):
-            assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": "timeout"}})
-            logger.info(f"Timeout para {advisor} con cliente {client_id}, intentando siguiente asesor")
+            now = datetime.utcnow()
+            assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": "timeout", "response_time": now}})
+            # Guardar en bitácora el timeout
+            guardar_bitacora({
+                "event": "advisor_timeout",
+                "client_id": client_id,
+                "advisor_phone": advisor_phone,
+                "advisor_name": assignment["advisor_name"],
+                "timeout_time": now,
+                "original_ask_time": assignment["sent_time"]
+            })
+            logger.info(f"Timeout para {advisor_phone} con cliente {client_id}, intentando siguiente asesor")
             asyncio.run(send_to_next_advisor(client_id))
     except Exception as e:
-        logger.error(f"Error en check_timeout para {client_id}, asesor {advisor}: {e}", exc_info=True)
+        logger.error(f"Error en check_timeout para {client_id}, asesor {advisor_phone}: {e}", exc_info=True)
 
 @app.post("/advisor_response")
 async def advisor_response(req: AdvisorResponse):
@@ -295,7 +323,18 @@ async def advisor_response(req: AdvisorResponse):
         if not assignment:
             logger.warning(f"No se encontró asignación pendiente para cliente {cliente_id} y asesor {asesor_phone}")
             return {"texto": "Asignación no encontrada"}
-        assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": respuesta}})
+        now = datetime.utcnow()
+        assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": respuesta, "response_time": now}})
+        # Guardar en bitácora la respuesta del asesor
+        guardar_bitacora({
+            "event": "advisor_response",
+            "client_id": cliente_id,
+            "advisor_phone": asesor_phone,
+            "advisor_name": assignment["advisor_name"],
+            "response": respuesta,
+            "response_time": now,
+            "original_ask_time": assignment["sent_time"]
+        })
         sesion = obtener_sesion(cliente_id)
         if respuesta == "yes":
             info_cliente = {
@@ -307,7 +346,15 @@ async def advisor_response(req: AdvisorResponse):
                 "fecha": datetime.utcnow().strftime("%Y-%m-%d"),
                 "hora": datetime.utcnow().strftime("%H:%M:%S")
             }
-            guardar_bitacora(info_cliente)
+            # Guardar en bitácora la asignación final
+            guardar_bitacora({
+                "event": "client_assigned",
+                "client_id": cliente_id,
+                "advisor_phone": asesor_phone,
+                "advisor_name": assignment["advisor_name"],
+                "assignment_time": now,
+                "client_info": info_cliente
+            })
             client_message = f"{sesion['nombre']}, tu interés en el {sesion['tipo_auto']} {sesion['modelo']} está registrado. El ejecutivo {assignment['advisor_name']} te contactará pronto."
             sends_col.insert_one({
                 "jid": cliente_id,
@@ -415,9 +462,9 @@ async def webhook(req: Mensaje):
         if sesion.get("modelo_confirmado"):
             logger.info(f"Sesión ya confirmada para {cliente_id}: {sesion}")
             if any(keyword in texto.lower() for keyword in ["documentos", "requisitos", "papeles"]):
-                contexto = f"El cliente {sesion['nombre']} ha preguntado por documentos necesarios para la compra del modelo {sesion['modelo']}."
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} ha preguntado por documentos necesarios para la compra del modelo {sesion['modelo']}."
                 expected_response = (
-                    f"{sesion['nombre']}, para comprar tu {sesion['modelo']} necesitas: "
+                    f"{sesion.get('nombre', 'Cliente')}, para comprar tu {sesion['modelo']} necesitas: "
                     "1) Identificación oficial (INE o pasaporte), "
                     "2) Comprobante de domicilio (máximo 3 meses), "
                     "3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), "
@@ -427,34 +474,33 @@ async def webhook(req: Mensaje):
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
-            elif any(keyword in texto.lower() for keyword in ["no me ha contactado", "nadie me ha contactado", "no me han atendido","no me han contactado"]):
-                contexto = f"El cliente {sesion['nombre']} expresó que no ha recibido atención después de confirmar el modelo {sesion['modelo']}."
-                expected_response = f"{sesion['nombre']}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Algo más en lo que pueda ayudarte?"
+            elif any(keyword in texto.lower() for keyword in ["no me ha contactado", "nadie me ha contactado", "no me han atendido", "no me han contactado"]):
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} expresó que no ha recibido atención después de confirmar el modelo {sesion['modelo']}."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, disculpa la demora. Nuestros ejecutivos se encuentran en llamada y en cuanto se desocupen te atenderán. Tu atención es prioritaria para nosotros. ¿Algo más en lo que pueda ayudarte?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             elif any(keyword in texto.lower() for keyword in ["gracias", "no, gracias", "ok", "de nada", "okey"]):
-                contexto = f"El cliente {sesion['nombre']} dijo '{texto}' después de confirmar el modelo {sesion['modelo']}."
-                expected_response = f"De nada, {sesion['nombre']}. Un ejecutivo te contactará pronto."
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} dijo '{texto}' después de confirmar el modelo {sesion['modelo']}."
+                expected_response = f"De nada, {sesion.get('nombre', 'Cliente')}. Un ejecutivo te contactará pronto."
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             elif texto.lower() in ["hola", "hi", "buenas"]:
-                contexto = f"El cliente {sesion['nombre']} envió un saludo después de confirmar el modelo {sesion['modelo']}."
-                expected_response = f"Hola {sesion['nombre']}. Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} envió un saludo después de confirmar el modelo {sesion['modelo']}."
+                expected_response = f"Hola {sesion.get('nombre', 'Cliente')}. Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             else:
-                contexto = f"El cliente {sesion['nombre']} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente."
-                expected_response = f"Hola {sesion['nombre']}. Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} ya confirmó el modelo {sesion['modelo']}. Responde amigablemente."
+                expected_response = f"Hola {sesion.get('nombre', 'Cliente')}. Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
 
         # Manejar solicitud de hablar con un ejecutivo
         if "hablar con un ejecutivo" in texto.lower() or "ejecutivo" in texto.lower():
-            # Manejar nombre
             if "nombre" not in sesion:
                 contexto = "El cliente pidió hablar con un ejecutivo pero no ha proporcionado un nombre. Pide el nombre de forma amigable."
                 expected_response = f"¡Bienvenido(a) a {AGENCIA}! 😊 ¿Me puedes proporcionar tu nombre, por favor?"
@@ -463,7 +509,7 @@ async def webhook(req: Mensaje):
                 return {"texto": respuesta, "botones": botones}
             else:
                 await send_to_next_advisor(cliente_id)
-                sesion["modelo_confirmado"] = True  # Asumir confirmación para avanzar al contacto
+                sesion["modelo_confirmado"] = True
                 guardar_sesion(cliente_id, sesion)
                 contexto = f"El cliente {sesion['nombre']} pidió hablar con un ejecutivo."
                 expected_response = f"{sesion['nombre']}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
@@ -531,30 +577,20 @@ async def webhook(req: Mensaje):
         if "nombre" not in sesion:
             nombre_valido = None
             texto_lower = texto.lower()
-            # Lista de frases comunes a ignorar
             frases_comunes = [
-                r"mi nombre es",
-                r"claro que sí",
-                r"claro que si",
-                r"soy",
-                r"me llamo",
-                r"mi nombre",
-                r"claro",
-                r"ok",
-                r"de acuerdo"
+                r"mi nombre es", r"claro que sí", r"claro que si", r"soy", r"me llamo", r"mi nombre", r"claro",
+                r"ok", r"de acuerdo", r"no", r"que no"
             ]
-            # Limpiar el texto de frases comunes
             nombre_candidato = texto_lower
             for frase in frases_comunes:
                 nombre_candidato = re.sub(frase, "", nombre_candidato, flags=re.IGNORECASE)
             nombre_candidato = " ".join(nombre_candidato.split()).strip()
-            # Validar el nombre limpio
             if re.match(r'^[a-zA-ZáéíóúÁÉÍÓÚñÑ\s]{3,}$', nombre_candidato) and nombre_candidato.lower() not in [
-                "nuevo", "usado", "sí", "si", "no", "gracias", "teramont", "q5", "a3", "onix", "eclipse"
+                "nuevo", "usado", "sí", "si", "no", "gracias", "teramont", "q5", "a3", "onix", "eclipse",
+                "que", "hola", "hi", "buenas"
             ]:
-                # Aceptar nombres compuestos o individuales si tienen sentido
                 palabras = nombre_candidato.split()
-                if len(palabras) >= 1:  # Aceptar al menos un nombre válido
+                if len(palabras) >= 1:
                     nombre_valido = " ".join(palabras).title()
                 else:
                     match = re.search(r'(?:mi nombre es|soy|me llamo)\s+([a-zA-ZáéíóúÁÉÍÓÚñÑ\s]+)', texto_lower, re.IGNORECASE)
@@ -573,6 +609,15 @@ async def webhook(req: Mensaje):
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             else:
+                # Después de un intento fallido, pasar a preguntar por el interés de compra
+                sesion["nombre_intento_fallido"] = sesion.get("nombre_intento_fallido", 0) + 1
+                guardar_sesion(cliente_id, sesion)
+                if sesion.get("nombre_intento_fallido", 0) > 1:
+                    contexto = "El cliente no proporcionó un nombre válido después de varios intentos. Pregunta por el interés de compra."
+                    expected_response = "No has proporcionado un nombre válido. ¿Buscas un auto nuevo o usado? Nota que necesitarás dar tu nombre para que un asesor pueda comunicarse contigo."
+                    respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Nuevo", "Usado"])
+                    logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
+                    return {"texto": respuesta, "botones": botones}
                 contexto = "El cliente no ha proporcionado un nombre válido. Pide el nombre de forma amigable."
                 expected_response = f"Disculpa, no entendí tu nombre. ¿Me dices cómo te llamas?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, True, expected_response, [])
@@ -587,20 +632,20 @@ async def webhook(req: Mensaje):
                 if not modelos:
                     logger.error(f"No se encontraron modelos para tipo_auto {sesion['tipo_auto']}")
                     contexto = f"No se pudieron obtener modelos de autos {sesion['tipo_auto']}. Informa al cliente y sugiere reintentar."
-                    expected_response = f"{sesion['nombre']}, lo siento, no tenemos la lista de modelos disponible ahora. ¿Quieres intentar de nuevo?"
+                    expected_response = f"{sesion.get('nombre', 'Cliente')}, lo siento, no tenemos la lista de modelos disponible ahora. ¿Quieres intentar de nuevo?"
                     respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Reintentar"])
                     logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                     return {"texto": respuesta, "botones": botones}
                 sesion["modelos"] = modelos
                 guardar_sesion(cliente_id, sesion)
-                contexto = f"El cliente {sesion['nombre']} ha seleccionado tipo_auto {texto}. Muestra los modelos disponibles."
-                expected_response = f"{sesion['nombre']}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} ha seleccionado tipo_auto {texto}. Muestra los modelos disponibles."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, modelos[:5])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             else:
-                contexto = f"El cliente {sesion['nombre']} no ha especificado si quiere un auto nuevo o usado. Pregunta de forma clara."
-                expected_response = f"{sesion['nombre']}, ¿buscas un auto nuevo o usado?"
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} no ha especificado si quiere un auto nuevo o usado. Pregunta de forma clara."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, ¿buscas un auto nuevo o usado?"
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Nuevo", "Usado"])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
@@ -610,20 +655,25 @@ async def webhook(req: Mensaje):
         modelos = sesion.get("modelos", obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados())
         if not modelos:
             contexto = f"No se pudieron obtener modelos de autos {tipo}. Informa al cliente y sugiere reintentar o contactar a un ejecutivo."
-            expected_response = f"{sesion['nombre']}, lo siento, no tenemos la lista de modelos disponible ahora. ¿Quieres intentar de nuevo o prefieres hablar con un ejecutivo?"
+            expected_response = f"{sesion.get('nombre', 'Cliente')}, lo siento, no tenemos la lista de modelos disponible ahora. ¿Quieres intentar de nuevo o prefieres hablar con un ejecutivo?"
             respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Reintentar", "Hablar con ejecutivo"])
             logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
             return {"texto": respuesta, "botones": botones}
 
         # Confirmación de modelo
         if "modelo" in sesion and not sesion.get("modelo_confirmado"):
-            # Detectar cualquier respuesta que indique confirmación
             texto_lower = texto.lower().strip()
             confirmaciones = [
                 "sí", "si", "yes", "confirmo", "claro que sí", "sii ese", "ok", "okey", "así es", "asi es",
                 "si confirmo", "sí confirmo", "confirm", "vale", "está bien", "sí, ese"
             ]
             if any(conf in texto_lower or levenshtein_distance(texto_lower, conf) <= 2 for conf in confirmaciones):
+                if "nombre" not in sesion:
+                    contexto = "El cliente confirmó un modelo pero no proporcionó un nombre. Explica la necesidad del nombre."
+                    expected_response = "Has confirmado un modelo, pero no has proporcionado tu nombre. Es necesario dar tu nombre para que un asesor pueda comunicarse contigo. ¿Me dices cómo te llamas?"
+                    respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
+                    logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
+                    return {"texto": respuesta, "botones": botones}
                 await send_to_next_advisor(cliente_id)
                 sesion["modelo_confirmado"] = True
                 guardar_sesion(cliente_id, sesion)
@@ -638,20 +688,20 @@ async def webhook(req: Mensaje):
                 modelos = obtener_autos_nuevos() if tipo == "nuevo" else obtener_autos_usados()
                 sesion["modelos"] = modelos
                 guardar_sesion(cliente_id, sesion)
-                contexto = f"El cliente {sesion['nombre']} no confirmó el modelo y quiere elegir otro."
-                expected_response = f"{sesion['nombre']}, ¿cuál modelo prefieres? Estos son los disponibles: {', '.join(modelos)}."
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} no confirmó el modelo y quiere elegir otro."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, ¿cuál modelo prefieres? Estos son los disponibles: {', '.join(modelos)}."
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, modelos[:5])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             elif any(keyword in texto_lower for keyword in ["gracias", "no, gracias", "ok", "de nada"]):
-                contexto = f"El cliente {sesion['nombre']} dijo '{texto}' antes de confirmar el modelo {sesion['modelo']}."
-                expected_response = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} dijo '{texto}' antes de confirmar el modelo {sesion['modelo']}."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Sí", "Cambiar modelo"])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
             else:
-                contexto = f"El cliente {sesion['nombre']} no ha confirmado el modelo {sesion['modelo']}."
-                expected_response = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} no ha confirmado el modelo {sesion['modelo']}."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, ¿confirmas que quieres el modelo {sesion['modelo']}? Si prefieres otro, dime cuál."
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Sí", "Cambiar modelo"])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
@@ -663,8 +713,8 @@ async def webhook(req: Mensaje):
             model_normalized = normalizar_modelo(m)
             if texto_normalized and model_normalized and (
                 texto_normalized.lower() == model_normalized.lower() or
-                texto_normalized.lower() in model_normalized.lower().split() or
-                levenshtein_distance(texto_normalized.lower(), model_normalized.lower()) <= 3
+                texto_normalized.lower() in model_normalized.lower() or
+                levenshtein_distance(texto_normalized.lower(), model_normalized.lower()) <= 2
             ):
                 modelo_seleccionado = m
                 break
@@ -672,14 +722,14 @@ async def webhook(req: Mensaje):
             sesion["modelo"] = modelo_seleccionado
             sesion["modelo_confirmado"] = False
             guardar_sesion(cliente_id, sesion)
-            contexto = f"El cliente {sesion['nombre']} ha seleccionado el modelo {modelo_seleccionado}."
-            expected_response = f"{sesion['nombre']}, ¿confirmas que quieres el modelo {modelo_seleccionado}? Si prefieres otro, dime cuál."
+            contexto = f"El cliente {sesion.get('nombre', 'Cliente')} ha seleccionado el modelo {modelo_seleccionado}."
+            expected_response = f"{sesion.get('nombre', 'Cliente')}, ¿confirmas que quieres el modelo {modelo_seleccionado}? Si prefieres otro, dime cuál."
             respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, ["Sí", "Cambiar modelo"])
             logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
             return {"texto": respuesta, "botones": botones}
         else:
-            contexto = f"El cliente {sesion['nombre']} no ha seleccionado un modelo válido."
-            expected_response = f"{sesion['nombre']}, lo siento, ese modelo no está disponible. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
+            contexto = f"El cliente {sesion.get('nombre', 'Cliente')} no ha seleccionado un modelo válido."
+            expected_response = f"{sesion.get('nombre', 'Cliente')}, lo siento, ese modelo no está disponible. Estos son los modelos disponibles: {', '.join(modelos)}. ¿Cuál te interesa?"
             respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, modelos[:5])
             logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
             return {"texto": respuesta, "botones": botones}
@@ -690,6 +740,7 @@ async def webhook(req: Mensaje):
         respuesta, botones = generar_respuesta_ollama(texto, "Error en el procesamiento del mensaje.", False, expected_response, [])
         logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
         return {"texto": respuesta, "botones": botones}
+
 
 # ------------------------------
 # Scheduler refresco cache
