@@ -2,6 +2,8 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from pymongo import MongoClient
 from datetime import datetime, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.jobstores.mongodb import MongoDBJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 import random
 import requests
@@ -11,7 +13,7 @@ import asyncio
 from ollama import GenerateResponse
 from Levenshtein import distance as levenshtein_distance
 import re
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from bson import ObjectId
 
 # ------------------------------
 # Configuración básica
@@ -39,15 +41,23 @@ bitacora_col = db["bitacora"]
 asesores_col = db["asesores"]
 sends_col = db["sends"]
 assignments_col = db["assignments"]
-bitacora_col = db["bitacora"]
 
-# Configuración del scheduler
-scheduler = AsyncIOScheduler()
+# Configuración del scheduler con MongoDBJobStore
+scheduler = AsyncIOScheduler({
+    'jobstores': {
+        'default': MongoDBJobStore(database='chatbot_db', collection='scheduler_jobs', client=client)
+    }
+})
 
 BOT_NOMBRE = "Alex"
 AGENCIA = "Volkswagen Eurocity Culiacán"
-TIEMPO_RESPUESTA_EJECUTIVO = 300
-MODELOS_RESPALDO = ["Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1", "Nivus", "Taos", "T-Cross", "Virtus", "Jetta", "Tiguan", "Jetta GLI", "GTI", "Amarok Life", "Amarok Style", "Amarok Aventura", "Cross Sport", "Crafter", "Caddy"]
+TIEMPO_RESPUESTA_EJECUTIVO = 300  # 5 minutos
+MODELOS_RESPALDO = [
+    "Polo", "Saveiro", "Teramont", "Amarok Panamericana", "Transporter 6.1",
+    "Nivus", "Taos", "T-Cross", "Virtus", "Jetta", "Tiguan", "Jetta GLI",
+    "GTI", "Amarok Life", "Amarok Style", "Amarok Aventura", "Cross Sport",
+    "Crafter", "Caddy"
+]
 
 # ------------------------------
 # Pydantic models
@@ -105,30 +115,26 @@ def obtener_autos_nuevos(force_refresh=False):
             return cache.get("data", [])
         url = "https://vw-eurocity.com.mx/info/consultas.ashx"
         payload = {"r": "cargaAutosTodos", "x": "0.123456789"} 
-        #logger.info(f"Enviando solicitud a {url} con payload {payload}")
         res = requests.post(url, data=payload, headers=headers, timeout=10)
         res.raise_for_status()
-
         data = res.json()
 
         #logger.info(f"Respuesta de la API (autos nuevos): {data}")
         modelos_unicos = set()   # aquí evitamos duplicados
         modelos = []
-
         for auto in data:
             modelo = auto.get("modelo")
             if modelo and modelo not in modelos_unicos:
                 modelos_unicos.add(modelo)
                 modelos.append(modelo)
-
         # Guardamos en cache sin duplicados
         cache_col.update_one(
             {"_id": "autos_nuevos"},
             {"$set": {"data": modelos, "ts": ahora}},
             upsert=True
         )
+        logger.info(f"Autos nuevos obtenidos: {modelos}")
         return modelos
-    
     except Exception as e:
         logger.error(f"Error al obtener autos nuevos: {e}", exc_info=True)
         return MODELOS_RESPALDO
@@ -141,7 +147,6 @@ def obtener_autos_usados(force_refresh=False):
         if cache and not force_refresh and (ahora - cache.get("ts", ahora) < timedelta(hours=3)):
             logger.info("Usando caché para autos usados")
             return cache.get("data", [])
-        
         url = "https://vw-eurocity.com.mx/SeminuevosMotorV3/info/consultas.aspx"
         headers_usados = {
             "X-Requested-With": "XMLHttpRequest",
@@ -161,26 +166,19 @@ def obtener_autos_usados(force_refresh=False):
             logger.warning("No se obtuvieron modelos usados, usando respaldo")
             modelos = []
             vistos = set()
-
             for auto in data.get("LiAutos", []):
                 modelo = auto.get("Modelo")
                 anio = auto.get("Anio")
-
                 # clave única: modelo+año
                 clave = f"{modelo}-{anio}"
-
                 if modelo and anio and clave not in vistos:
                     vistos.add(clave)
-                    modelos.append({
-                        "modelo": modelo,
-                        "anio": anio
-                    })
-        result = cache_col.update_one(
+                    modelos.append(f"{modelo} ({anio})")
+        cache_col.update_one(
             {"_id": "autos_usados"},
             {"$set": {"data": modelos, "ts": ahora}},
             upsert=True
         )
-        logger.info(f"Resultado de update_one para autos_usados: {result.modified_count} documentos modificados, {result.upserted_id} upserted")
         logger.info(f"Autos usados obtenidos: {modelos}")
         return modelos
     except Exception as e:
@@ -218,10 +216,41 @@ def guardar_bitacora(registro):
         logger.error(f"Error al guardar bitácora: {e}", exc_info=True)
 
 # ------------------------------
+# Limpieza de asignaciones obsoletas
+# ------------------------------
+async def cleanup_stale_assignments(client_id):
+    try:
+        now = datetime.utcnow()
+        result = assignments_col.update_many(
+            {
+                "client_id": client_id,
+                "status": "pending_availability",
+                "sent_time": {"$lt": now - timedelta(minutes=TIEMPO_RESPUESTA_EJECUTIVO)}
+            },
+            {"$set": {"status": "timeout", "response_time": now}}
+        )
+        if result.modified_count > 0:
+            logger.info(f"Limpieza: {result.modified_count} asignaciones obsoletas marcadas como timeout para {client_id}")
+            guardar_bitacora({
+                "event": "cleanup_stale_assignments",
+                "client_id": client_id,
+                "count": result.modified_count,
+                "time": now
+            })
+    except Exception as e:
+        logger.error(f"Error en cleanup_stale_assignments para {client_id}: {e}", exc_info=True)
+        guardar_bitacora({
+            "event": "error_cleanup_assignments",
+            "client_id": client_id,
+            "error": str(e),
+            "time": datetime.utcnow()
+        })
+
+# ------------------------------
 # Asignación de ejecutivos
 # ----------------------
 @app.get("/get_asesores")
-def get_asesores():
+async def get_asesores():
     try:
         asesores = list(asesores_col.find({"activo": True}, {"telefono": 1, "nombre": 1, "_id": 0}))
         for advisor in asesores:
@@ -234,12 +263,29 @@ def get_asesores():
 
 async def send_to_next_advisor(client_id):
     try:
+        # Limpiar asignaciones obsoletas antes de asignar
+        await cleanup_stale_assignments(client_id)
         sesion = obtener_sesion(client_id)
+        logger.info(f"Sesión para {client_id}: {sesion}")
         if "nombre" not in sesion or "tipo_auto" not in sesion or "modelo" not in sesion:
             logger.warning(f"Sesión incompleta para {client_id}: {sesion}")
+            sends_col.insert_one({
+                "jid": client_id,
+                "message": f"{sesion.get('nombre', 'Cliente')}, por favor proporciona toda la información necesaria.",
+                "sent": False,
+                "sent_time": datetime.utcnow()
+            })
+            guardar_bitacora({
+                "event": "incomplete_session",
+                "client_id": client_id,
+                "session": sesion,
+                "time": datetime.utcnow()
+            })
             return False
-        active_advisors = get_asesores()
+        active_advisors = await get_asesores()
         assigned_advisors = sesion.get("assigned_advisors", [])
+        logger.info(f"Asesores asignados para {client_id}: {assigned_advisors}")
+        logger.info(f"Asesores activos disponibles: {active_advisors}")
         next_advisor = next((advisor for advisor in active_advisors if advisor["telefono"] not in assigned_advisors), None)
         if next_advisor:
             assigned_advisors.append(next_advisor["telefono"])
@@ -251,7 +297,7 @@ async def send_to_next_advisor(client_id):
                 advisor_jid = f"521{advisor_jid}"
             advisor_jid = f"{advisor_jid}@s.whatsapp.net"
             logger.info(f"Generando jid para asesor: {advisor_jid}")
-# Preguntar solo por disponibilidad
+            # Preguntar solo por disponibilidad
             message = f"Hola {next_advisor['nombre']}, ¿estás disponible para atender a un cliente ahora?"
             sends_col.insert_one({
                 "jid": advisor_jid,
@@ -278,7 +324,8 @@ async def send_to_next_advisor(client_id):
                 "advisor_phone": next_advisor["telefono"],
                 "advisor_name": next_advisor["nombre"],
                 "ask_time": datetime.utcnow(),
-                "message": message
+                "message": message,
+                "assignment_id": str(assignment_id)
             })
             
             logger.info(f"Programando timeout para cliente {client_id}, asesor {next_advisor['telefono']} en {TIEMPO_RESPUESTA_EJECUTIVO} segundos")
@@ -286,8 +333,9 @@ async def send_to_next_advisor(client_id):
                 check_timeout,
                 'date',
                 run_date=datetime.utcnow() + timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO),
-                args=[client_id, next_advisor["telefono"], assignment_id],
-                id=f"timeout_{client_id}_{next_advisor['telefono']}"
+                args=[client_id, next_advisor["telefono"], str(assignment_id)],
+                id=f"timeout_{client_id}_{next_advisor['telefono']}",
+                replace_existing=True
             )
             logger.info(f"Pregunta de disponibilidad enviada a {next_advisor['nombre']} ({advisor_jid}) para cliente {client_id}")
             return True
@@ -296,7 +344,8 @@ async def send_to_next_advisor(client_id):
             sends_col.insert_one({
                 "jid": client_id,
                 "message": f"{sesion['nombre']}, lo siento, no hay ejecutivos disponibles ahora. Por favor, intenta de nuevo más tarde.",
-                "sent": False
+                "sent": False,
+                "sent_time": datetime.utcnow()
             })
             # Guardar en bitácora que no hay asesores disponibles
             guardar_bitacora({
@@ -310,7 +359,8 @@ async def send_to_next_advisor(client_id):
         sends_col.insert_one({
             "jid": client_id,
             "message": f"{sesion.get('nombre', 'Cliente')}, lo siento, ocurrió un error al asignar un ejecutivo. Por favor, intenta de nuevo.",
-            "sent": False
+            "sent": False,
+            "sent_time": datetime.utcnow()
         })
         # Guardar en bitácora el error
         guardar_bitacora({
@@ -324,34 +374,64 @@ async def send_to_next_advisor(client_id):
 async def check_timeout(client_id, advisor_phone, assignment_id):
     try:
         logger.info(f"Verificando timeout para cliente {client_id}, asesor {advisor_phone}, assignment_id {assignment_id}")
-        assignment = assignments_col.find_one({"_id": assignment_id, "client_id": client_id, "advisor_phone": advisor_phone, "status": "pending_availability"})
-        if assignment:
-            now = datetime.utcnow()
-            time_elapsed = (now - assignment["sent_time"]).total_seconds()
-            logger.info(f"Tiempo transcurrido para {client_id} con asesor {advisor_phone}: {time_elapsed} segundos")
-            if time_elapsed >= TIEMPO_RESPUESTA_EJECUTIVO:
-                assignments_col.update_one({"_id": assignment["_id"]}, {"$set": {"status": "timeout", "response_time": now}})
-                guardar_bitacora({
-                    "event": "advisor_timeout",
-                    "client_id": client_id,
-                    "advisor_phone": advisor_phone,
-                    "advisor_name": assignment["advisor_name"],
-                    "timeout_time": now,
-                    "original_ask_time": assignment["sent_time"]
-                })
-                logger.info(f"Timeout para {advisor_phone} con cliente {client_id}, intentando siguiente asesor")
-                await send_to_next_advisor(client_id)
-            else:
-                logger.info(f"Tiempo no alcanzado para {client_id} con {advisor_phone}, tiempo restante: {TIEMPO_RESPUESTA_EJECUTIVO - time_elapsed} segundos")
-        else:
+        assignment = assignments_col.find_one({
+            "_id": ObjectId(assignment_id),
+            "client_id": client_id,
+            "advisor_phone": advisor_phone,
+            "status": "pending_availability"
+        })
+        logger.info(f"Asignación encontrada: {assignment}")
+        if not assignment:
             logger.warning(f"No se encontró asignación pendiente para cliente {client_id}, asesor {advisor_phone}, assignment_id {assignment_id}")
+            all_assignments = list(assignments_col.find({"client_id": client_id}))
+            logger.info(f"Todas las asignaciones para {client_id}: {all_assignments}")
+            guardar_bitacora({
+                "event": "timeout_check_failed",
+                "client_id": client_id,
+                "advisor_phone": advisor_phone,
+                "assignment_id": assignment_id,
+                "error": "No se encontró asignación pendiente",
+                "time": datetime.utcnow()
+            })
+            return
+        now = datetime.utcnow()
+        time_elapsed = (now - assignment["sent_time"]).total_seconds()
+        logger.info(f"Tiempo transcurrido para {client_id} con asesor {advisor_phone}: {time_elapsed} segundos")
+        if time_elapsed >= TIEMPO_RESPUESTA_EJECUTIVO:
+            assignments_col.update_one(
+                {"_id": ObjectId(assignment_id)},
+                {"$set": {"status": "timeout", "response_time": now}}
+            )
+            logger.info(f"Marcando asignación {assignment_id} como timeout")
+            guardar_bitacora({
+                "event": "advisor_timeout",
+                "client_id": client_id,
+                "advisor_phone": advisor_phone,
+                "advisor_name": assignment["advisor_name"],
+                "timeout_time": now,
+                "original_ask_time": assignment["sent_time"],
+                "assignment_id": str(assignment_id)
+            })
+            logger.info(f"Timeout para {advisor_phone} con cliente {client_id}, intentando siguiente asesor")
+            await send_to_next_advisor(client_id)
+        else:
+            logger.info(f"Tiempo no alcanzado para {client_id} con {advisor_phone}, tiempo restante: {TIEMPO_RESPUESTA_EJECUTIVO - time_elapsed} segundos")
+            scheduler.add_job(
+                check_timeout,
+                'date',
+                run_date=datetime.utcnow() + timedelta(seconds=TIEMPO_RESPUESTA_EJECUTIVO - time_elapsed),
+                args=[client_id, advisor_phone, str(assignment_id)],
+                id=f"timeout_{client_id}_{advisor_phone}",
+                replace_existing=True
+            )
+            logger.info(f"Reprogramado timeout para cliente {client_id}, asesor {advisor_phone} en {TIEMPO_RESPUESTA_EJECUTIVO - time_elapsed} segundos")
     except Exception as e:
-        logger.error(f"Error en check_timeout para {client_id}, asesor {advisor_phone}: {e}", exc_info=True)
-        # Guardar en bitácora el error
+        logger.error(f"Error en check_timeout para {client_id}, asesor {advisor_phone}, assignment_id {assignment_id}: {e}", exc_info=True)
         guardar_bitacora({
             "event": "error_timeout_check",
             "client_id": client_id,
             "advisor_phone": advisor_phone,
+            "assignment_id": assignment_id,
             "error": str(e),
             "time": datetime.utcnow()
         })
@@ -365,6 +445,13 @@ async def advisor_response(req: AdvisorResponse):
         assignment = assignments_col.find_one({"client_id": cliente_id, "advisor_phone": asesor_phone, "status": "pending_availability"})
         if not assignment:
             logger.warning(f"No se encontró asignación pendiente para cliente {cliente_id} y asesor {asesor_phone}")
+            guardar_bitacora({
+                "event": "advisor_response_failed",
+                "client_id": cliente_id,
+                "advisor_phone": asesor_phone,
+                "error": "No se encontró asignación pendiente",
+                "time": datetime.utcnow()
+            })
             return {"texto": "Asignación no encontrada"}
         now = datetime.utcnow()
         # Guardar en bitácora la respuesta del asesor
@@ -375,7 +462,8 @@ async def advisor_response(req: AdvisorResponse):
             "advisor_name": assignment["advisor_name"],
             "response": respuesta,
             "response_time": now,
-            "original_ask_time": assignment["sent_time"]
+            "original_ask_time": assignment["sent_time"],
+            "assignment_id": str(assignment["_id"])
         })
         if respuesta == "yes":
             sesion = obtener_sesion(cliente_id)
@@ -400,7 +488,8 @@ async def advisor_response(req: AdvisorResponse):
                 "advisor_phone": asesor_phone,
                 "advisor_name": assignment["advisor_name"],
                 "sent_time": now,
-                "message": client_summary
+                "message": client_summary,
+                "assignment_id": str(assignment["_id"])
             })
             # Registrar asignación final
             info_cliente = {
@@ -418,7 +507,8 @@ async def advisor_response(req: AdvisorResponse):
                 "advisor_phone": asesor_phone,
                 "advisor_name": assignment["advisor_name"],
                 "assignment_time": now,
-                "client_info": info_cliente
+                "client_info": info_cliente,
+                "assignment_id": str(assignment["_id"])
             })
             client_message = (
                 f"{sesion['nombre']}, tu interés en el {sesion['tipo_auto']} {sesion['modelo']} está registrado. "
@@ -427,7 +517,8 @@ async def advisor_response(req: AdvisorResponse):
             sends_col.insert_one({
                 "jid": cliente_id,
                 "message": client_message,
-                "sent": False
+                "sent": False,
+                "sent_time": datetime.utcnow()
             })
             sesion["modelo_confirmado"] = True
             guardar_sesion(cliente_id, sesion)
@@ -480,8 +571,8 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             "Si el cliente pregunta por 'documentos', 'requisitos' o 'papeles', responde SOLO: '{nombre}, para comprar tu {modelo} necesitas: 1) Identificación oficial (INE o pasaporte), 2) Comprobante de domicilio (máximo 3 meses), 3) Comprobantes de ingresos (3 últimos recibos de nómina o estados de cuenta), 4) Solicitud de crédito (si aplica). Un ejecutivo te dará más detalles. ¿Algo más en lo que pueda ayudarte?' "
             "Si el cliente pide 'hablar con un ejecutivo', verifica si tienes su nombre; if not, respond: '¡Bienvenido(a) a Volkswagen Eurocity Culiacán! 😊 ¿Me puedes proporcionar tu nombre, por favor?' Then, respond ONLY: '{nombre}, un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?' "
             "If the client says 'gracias', 'no, gracias' or similar after confirming a model, respond ONLY: 'De nada, {nombre}. Pronto uno de nuestros ejecutivos se pondrá en contacto contigo.' "
-            "If the client sends greetings (e.g., 'hola', 'hi') after confirming a model, respond ONLY: 'Hola {nombre}. Tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?'"
-            "Si el cliente pregunta 'cuál es el nombre del asesor?','cuál es el nombre del ejecutivo?', 'en qué tanto tiempo me contactarán?' o 'en cuanto tiempo?', responde SOLO: "
+            "If the client sends greetings (e.g., 'hola', 'hi') after confirming a model, respond ONLY: 'Hola {nombre}. Tu interés en el modelo {modelo} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?' "
+            "Si el cliente pregunta 'cuál es el nombre del asesor?', 'cuál es el nombre del ejecutivo?', 'en qué tanto tiempo me contactarán?' o 'en cuanto tiempo?', responde SOLO: "
             "   - Para 'cuál es el nombre del asesor?' o 'ejecutivo': '{nombre}, no tengo el nombre del asesor asignado aún, ya que se determina cuando un ejecutivo esté disponible. Te informaré cuando te contacten.' "
             "   - Para 'en qué tanto tiempo me contactarán?' o 'en cuanto tiempo?': '{nombre}, te contactarán lo antes posible, generalmente dentro de unos 5 a 10 minutos una vez que un asesor se desocupe.' "
         )
@@ -498,19 +589,18 @@ def generar_respuesta_ollama(prompt, contexto_sesion=None, es_primer_mensaje=Fal
             respuesta = str(resp['response']).strip()
         else:
             logger.error(f"Respuesta de Ollama no válida: tipo={type(resp)}, contenido={resp}")
-            return expected_response if expected_response else "Disculpa, algo salió mal. Por favor, intenta de nuevo.", buttons
+            return expected_response if expected_response else "Disculpa, algo salió mal. Por favor, intenta de nuevo.", buttons or []
         if not respuesta:
             logger.warning("Ollama devolvió una respuesta vacía")
-            return expected_response if expected_response else "Disculpa, algo salió mal. Por favor, intenta de nuevo.", buttons
-        # Validate Ollama response against expected response
+            return expected_response if expected_response else "Disculpa, algo salió mal. Por favor, intenta de nuevo.", buttons or []
         if expected_response and respuesta != expected_response:
             logger.warning(f"Ollama response '{respuesta}' does not match expected '{expected_response}'")
-            return expected_response, buttons
+            return expected_response, buttons or []
         logger.info(f"Respuesta procesada de Ollama: {respuesta}")
-        return respuesta, buttons
+        return respuesta, buttons or []
     except Exception as e:
         logger.error(f"Error al comunicarse con Ollama: {e}", exc_info=True)
-        return expected_response if expected_response else "Disculpa, algo salió mal. Por favor, intenta de nuevo.", buttons
+        return expected_response if expected_response else "Disculpa, algo salió mal. Por favor, intenta de nuevo.", buttons or []
 
 # ------------------------------
 # Webhook operativo
@@ -561,6 +651,18 @@ async def webhook(req: Mensaje):
             elif texto.lower() in ["hola", "hi", "buenas"]:
                 contexto = f"El cliente {sesion.get('nombre', 'Cliente')} envió un saludo después de confirmar el modelo {sesion['modelo']}."
                 expected_response = f"Hola {sesion.get('nombre', 'Cliente')}. Tu interés en el modelo {sesion['modelo']} está registrado. Un ejecutivo te contactará pronto. ¿Algo más en lo que pueda ayudarte?"
+                respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
+                logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
+                return {"texto": respuesta, "botones": botones}
+            elif any(keyword in texto.lower() for keyword in ["cuál es el nombre del asesor", "cuál es el nombre del ejecutivo"]):
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} preguntó por el nombre del asesor después de confirmar el modelo {sesion['modelo']}."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, no tengo el nombre del asesor asignado aún, ya que se determina cuando un ejecutivo esté disponible. Te informaré cuando te contacten."
+                respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
+                logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
+                return {"texto": respuesta, "botones": botones}
+            elif any(keyword in texto.lower() for keyword in ["en qué tanto tiempo me contactarán", "en cuanto tiempo"]):
+                contexto = f"El cliente {sesion.get('nombre', 'Cliente')} preguntó por el tiempo de contacto después de confirmar el modelo {sesion['modelo']}."
+                expected_response = f"{sesion.get('nombre', 'Cliente')}, te contactarán lo antes posible, generalmente dentro de unos 5 a 10 minutos una vez que un asesor se desocupe."
                 respuesta, botones = generar_respuesta_ollama(texto, contexto, False, expected_response, [])
                 logger.info(f"Respuesta del webhook: texto={respuesta}, botones={botones}")
                 return {"texto": respuesta, "botones": botones}
@@ -650,8 +752,8 @@ async def webhook(req: Mensaje):
             nombre_valido = None
             texto_lower = texto.lower()
             frases_comunes = [
-                r"mi nombre es", r"claro que sí", r"claro que si", r"soy", r"me llamo", r"mi nombre", r"claro",
-                r"ok", r"de acuerdo", r"no", r"que no"
+                r"mi nombre es", r"claro que sí", r"claro que si", r"soy", r"me llamo", r"mi nombre",
+                r"claro", r"ok", r"de acuerdo", r"no", r"que no"
             ]
             nombre_candidato = texto_lower
             for frase in frases_comunes:
@@ -817,12 +919,29 @@ async def webhook(req: Mensaje):
 # ------------------------------
 # Scheduler refresco cache
 # ----------------------
-scheduler = BackgroundScheduler()
-scheduler.add_job(lambda: (obtener_autos_nuevos(force_refresh=True), obtener_autos_usados(force_refresh=True)), "interval", hours=3)
-scheduler.start()
+@app.on_event("startup")
+async def startup_event():
+    scheduler.start()
+    logger.info("Scheduler inicializado con MongoDBJobStore")
+    # Programar refresco de cache cada 3 horas
+    scheduler.add_job(
+        lambda: (obtener_autos_nuevos(force_refresh=True), obtener_autos_usados(force_refresh=True)),
+        "interval",
+        hours=3,
+        id="refresh_car_cache",
+        replace_existing=True
+    )
+    # Refrescar cache al iniciar
+    obtener_autos_nuevos(force_refresh=True)
+    obtener_autos_usados(force_refresh=True)
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    scheduler.shutdown()
+    logger.info("Scheduler detenido correctamente")
 
 if __name__ == "__main__":
     import uvicorn
-    obtener_autos_nuevos(force_refresh=True)
-    obtener_autos_usados(force_refresh=True)
+    #obtener_autos_nuevos(force_refresh=True)
+    #obtener_autos_usados(force_refresh=True)
     uvicorn.run(app, host="0.0.0.0", port=5000)
